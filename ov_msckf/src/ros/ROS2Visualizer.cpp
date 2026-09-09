@@ -199,6 +199,18 @@ void ROS2Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
     sync_subs_cam.push_back(image_sub1);
     PRINT_INFO("subscribing to cam (stereo): %s\n", cam_topic0.c_str());
     PRINT_INFO("subscribing to cam (stereo): %s\n", cam_topic1.c_str());
+  } else if (_app->get_params().use_stereo && _app->get_params().state_options.num_cameras > 2) {
+    // Ring stereo: every camera feeds callback_ring, which assembles one N-image measurement per stamp
+    for (int i = 0; i < _app->get_params().state_options.num_cameras; i++) {
+      std::string cam_topic;
+      _node->declare_parameter<std::string>("topic_camera" + std::to_string(i), "/cam" + std::to_string(i) + "/image_raw");
+      _node->get_parameter("topic_camera" + std::to_string(i), cam_topic);
+      parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "rostopic", cam_topic);
+      auto sub = _node->create_subscription<sensor_msgs::msg::Image>(
+          cam_topic, 10, [this, i](const sensor_msgs::msg::Image::SharedPtr msg0) { callback_ring(msg0, i); });
+      subs_cam.push_back(sub);
+      PRINT_INFO("subscribing to cam (ring stereo): %s" "\n", cam_topic.c_str());
+    }
   } else {
     // Now we should add any non-stereo callbacks here
     for (int i = 0; i < _app->get_params().state_options.num_cameras; i++) {
@@ -466,7 +478,8 @@ void ROS2Visualizer::callback_inertial(const sensor_msgs::msg::Imu::SharedPtr ms
     // If we do not have enough unique cameras then we need to wait
     // We should wait till we have one of each camera to ensure we propagate in the correct order
     auto params = _app->get_params();
-    size_t num_unique_cameras = (params.state_options.num_cameras == 2) ? 1 : params.state_options.num_cameras;
+    bool ring = (params.use_stereo && params.state_options.num_cameras > 2);
+    size_t num_unique_cameras = (params.state_options.num_cameras == 2 || ring) ? 1 : params.state_options.num_cameras;
     if (unique_cam_ids.size() == num_unique_cameras) {
 
       // Loop through our queue and see if we are able to process any of our camera measurements
@@ -530,6 +543,55 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
 
   // append it to our queue of images
   std::lock_guard<std::mutex> lck(camera_queue_mtx);
+  camera_queue.push_back(message);
+  std::sort(camera_queue.begin(), camera_queue.end());
+}
+
+void ROS2Visualizer::callback_ring(const sensor_msgs::msg::Image::SharedPtr msg0, int cam_id0) {
+
+  // Stamp key; all cameras of one frame share the stamp exactly
+  double timestamp = std::round((msg0->header.stamp.sec + msg0->header.stamp.nanosec * 1e-9) * 1e6) / 1e6;
+  int N = _app->get_params().state_options.num_cameras;
+  {
+    std::lock_guard<std::mutex> lck(ring_mtx);
+    double time_delta = 1.0 / _app->get_params().track_frequency;
+    bool started = (ring_buffer.find(timestamp) != ring_buffer.end());
+    if (!started && ring_last_timestamp >= 0 && timestamp < ring_last_timestamp + time_delta)
+      return;
+  }
+
+  cv_bridge::CvImageConstPtr cv_ptr;
+  try {
+    cv_ptr = cv_bridge::toCvShare(msg0, sensor_msgs::image_encodings::MONO8);
+  } catch (cv_bridge::Exception &e) {
+    PRINT_ERROR("cv_bridge exception: %s", e.what());
+    return;
+  }
+
+  std::lock_guard<std::mutex> lck(ring_mtx);
+  ring_buffer[timestamp][cam_id0] = cv_ptr->image.clone();
+  if ((int)ring_buffer[timestamp].size() < N)
+    return;
+
+  ov_core::CameraData message;
+  message.timestamp = timestamp;
+  for (int i = 0; i < N; i++) {
+    message.sensor_ids.push_back(i);
+    message.images.push_back(ring_buffer[timestamp].at(i));
+    if (_app->get_params().use_mask) {
+      message.masks.push_back(_app->get_params().masks.at(i));
+    } else {
+      message.masks.push_back(cv::Mat::zeros(message.images.back().rows, message.images.back().cols, CV_8UC1));
+    }
+  }
+  ring_last_timestamp = timestamp;
+  for (auto it = ring_buffer.begin(); it != ring_buffer.end();) {
+    if (it->first <= timestamp)
+      it = ring_buffer.erase(it);
+    else
+      ++it;
+  }
+  std::lock_guard<std::mutex> lck2(camera_queue_mtx);
   camera_queue.push_back(message);
   std::sort(camera_queue.begin(), camera_queue.end());
 }

@@ -79,6 +79,17 @@ protected:
   void feed_stereo(const CameraData &message, size_t msg_id_left, size_t msg_id_right);
 
   /**
+   * @brief Process N images as a ring of stereo pairs (0-1, 1-2, ..., N-1 - 0)
+   * @param message Contains our timestamp, images, and camera ids (all N cameras)
+   *
+   * Every camera is tracked temporally exactly once; new features are detected
+   * per adjacent pair and matched into the neighbour (seeded from the
+   * extrinsics), so one feature id can carry observations in two or three
+   * cameras of the same frame.
+   */
+  void feed_ring(const CameraData &message);
+
+  /**
    * @brief Detects new features in the current image
    * @param img0pyr image we will detect features on (first level of pyramid)
    * @param mask0 mask which has what ROI we do not want features in
@@ -115,6 +126,16 @@ protected:
                                 std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1);
 
   /**
+   * @brief Pair detection for feed_ring(): like perform_detection_stereo() but the
+   * search in the second image starts from the extrinsics-predicted location
+   * (far-point assumption) and a match must survive a forward-backward check
+   * and lie within ring_max_angle_deg of the predicted bearing.
+   */
+  void perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, const cv::Mat &mask0,
+                              const cv::Mat &mask1, size_t cam_id_left, size_t cam_id_right, std::vector<cv::KeyPoint> &pts0,
+                              std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1);
+
+  /**
    * @brief KLT track between two images, and do RANSAC afterwards
    * @param img0pyr starting image pyramid
    * @param img1pyr image pyramid we want to track too
@@ -130,6 +151,17 @@ protected:
    */
   void perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &pts0,
                         std::vector<cv::KeyPoint> &pts1, size_t id0, size_t id1, std::vector<uchar> &mask_out);
+
+  // Ring stereo: accept a cross-camera match only within this many degrees of the
+  // extrinsics-predicted bearing (parallax of a point >= 1 m away on a 0.23 m
+  // baseline is < 13 deg) and if the backward track returns within this many px.
+  double ring_max_angle_deg = 15.0;
+  double ring_fb_px = 2.0;
+
+  /// Ring stereo: per pair, remap tables that render the LEFT image in the RIGHT camera's projection (far-point assumption)
+  std::map<std::pair<size_t, size_t>, std::pair<cv::Mat, cv::Mat>> ring_maps;
+  std::mutex ring_maps_mtx;
+  const std::pair<cv::Mat, cv::Mat> &get_ring_map(size_t cam_id_left, size_t cam_id_right, int rows, int cols);
 
   // Parameters for our FAST grid detector
   int threshold;

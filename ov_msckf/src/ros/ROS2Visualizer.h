@@ -115,6 +115,9 @@ public:
   /// Callback for monocular cameras information
   void callback_monocular(const sensor_msgs::msg::Image::SharedPtr msg0, int cam_id0);
 
+  /// Ring stereo (use_stereo with > 2 cameras): collect all cameras of one stamp into a single measurement
+  void callback_ring(const sensor_msgs::msg::Image::SharedPtr msg0, int cam_id0);
+
   /// Callback for synchronized stereo camera information
   void callback_stereo(const sensor_msgs::msg::Image::ConstSharedPtr msg0, const sensor_msgs::msg::Image::ConstSharedPtr msg1, int cam_id0,
                        int cam_id1);
@@ -190,6 +193,11 @@ protected:
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;
+
+  // Ring stereo: per-stamp collection of the N camera images
+  std::mutex ring_mtx;
+  std::map<double, std::map<int, cv::Mat>> ring_buffer;
+  double ring_last_timestamp = -1.0;
 
   // Last timestamp we visualized at
   double last_visualization_timestamp = 0;

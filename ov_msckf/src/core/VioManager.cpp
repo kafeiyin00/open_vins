@@ -32,6 +32,7 @@
 #include "types/LandmarkRepresentation.h"
 #include "utils/opencv_lambda_body.h"
 #include "utils/print.h"
+#include "utils/quat_ops.h"
 #include "utils/sensor_data.h"
 
 #include "init/InertialInitializer.h"
@@ -137,6 +138,22 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
         state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
         params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+  }
+
+  // Ring stereo: with more than two cameras and use_stereo, every adjacent pair
+  // (0-1, 1-2, ..., N-1 - 0) is matched across; the tracker needs the relative
+  // rotations to know where to look in the neighbour.
+  if (params.use_stereo && params.state_options.num_cameras > 2) {
+    std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> rots;
+    int N = params.state_options.num_cameras;
+    for (int i = 0; i < N; i++) {
+      int j = (i + 1) % N;
+      Eigen::Matrix3d R_ItoCi = ov_core::quat_2_Rot(params.camera_extrinsics.at(i).block(0, 0, 4, 1));
+      Eigen::Matrix3d R_ItoCj = ov_core::quat_2_Rot(params.camera_extrinsics.at(j).block(0, 0, 4, 1));
+      rots[{(size_t)i, (size_t)j}] = R_ItoCj * R_ItoCi.transpose();
+    }
+    trackFEATS->set_pair_rotations(rots);
+    PRINT_INFO("[RING]: %d cameras tracked as a ring of stereo pairs (0-1 ... %d-0)\n", N, N - 1);
   }
 
   // Initialize our aruco tag extractor

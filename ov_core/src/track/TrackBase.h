@@ -22,7 +22,9 @@
 #ifndef OV_CORE_TRACK_BASE_H
 #define OV_CORE_TRACK_BASE_H
 
+#include <Eigen/Eigen>
 #include <atomic>
+#include <map>
 #include <iostream>
 #include <mutex>
 #include <thread>
@@ -151,12 +153,25 @@ public:
   /// Setter method for number of active features
   void set_num_features(int _num_features) { num_features = _num_features; }
 
+  /**
+   * @brief Ring stereo: relative rotations between adjacent cameras.
+   *
+   * Key (i, j) maps a bearing in camera i's optical frame into camera j's
+   * (R_{j<-i}). Used to seed the cross-camera KLT search when the cameras are
+   * far apart in orientation (e.g. four fisheyes 90 deg apart), where starting
+   * from the same pixel - what the stock stereo detector does - cannot work.
+   */
+  virtual void set_pair_rotations(const std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> &rots) { pair_rotations = rots; }
+
 protected:
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
 
   /// Database with all our current features
   std::shared_ptr<FeatureDatabase> database;
+
+  /// Ring stereo: R_{j<-i} for adjacent camera pairs (see set_pair_rotations)
+  std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> pair_rotations;
 
   /// If we are a fisheye model or not
   std::map<size_t, bool> camera_fisheye;
