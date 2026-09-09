@@ -21,6 +21,8 @@
 
 #include "VioManager.h"
 
+#include <limits>
+
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
@@ -412,6 +414,54 @@ cv::Mat VioManager::get_historical_viz_image() {
 
   // Finally return the image
   return img_history;
+}
+
+void VioManager::fill_token_stats(FeatToken &tok, const std::shared_ptr<ov_core::Feature> &feat) {
+  if (feat == nullptr)
+    return;
+  double tmin = std::numeric_limits<double>::max(), tmax = -1;
+  int n = 0, cams = 0;
+  for (auto const &ct : feat->timestamps) {
+    if (ct.second.empty())
+      continue;
+    cams |= (1 << (int)ct.first);
+    n += (int)ct.second.size();
+    for (double t : ct.second) {
+      tmin = std::min(tmin, t);
+      tmax = std::max(tmax, t);
+    }
+  }
+  if (n > 0) {
+    tok.track_len = (float)(tmax - tmin);
+    tok.n_obs = n;
+    tok.cams = cams;
+    tok.first_t = tmin;
+  }
+}
+
+std::vector<VioManager::FeatToken> VioManager::get_feature_tokens_SLAM() {
+  std::vector<FeatToken> toks;
+  auto db = trackFEATS->get_feature_database();
+  for (auto &f : state->_features_SLAM) {
+    if ((int)f.first <= 4 * state->_options.max_aruco_features)
+      continue;
+    FeatToken tok;
+    tok.id = f.first;
+    tok.kind = 0;
+    if (ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)) {
+      assert(f.second->_anchor_cam_id != -1);
+      Eigen::Matrix<double, 3, 3> R_ItoC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->Rot();
+      Eigen::Matrix<double, 3, 1> p_IinC = state->_calib_IMUtoCAM.at(f.second->_anchor_cam_id)->pos();
+      Eigen::Matrix<double, 3, 3> R_GtoI = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->Rot();
+      Eigen::Matrix<double, 3, 1> p_IinG = state->_clones_IMU.at(f.second->_anchor_clone_timestamp)->pos();
+      tok.p_FinG = R_GtoI.transpose() * R_ItoC.transpose() * (f.second->get_xyz(false) - p_IinC) + p_IinG;
+    } else {
+      tok.p_FinG = f.second->get_xyz(false);
+    }
+    fill_token_stats(tok, db->get_feature(f.first));
+    toks.push_back(tok);
+  }
+  return toks;
 }
 
 std::vector<Eigen::Vector3d> VioManager::get_features_SLAM() {

@@ -578,11 +578,18 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     // Thus we should be able to visualize the other unique camera stream
     // MSCKF features as they will also be appended to the vector
     good_features_MSCKF.clear();
+    good_feature_tokens_MSCKF.clear();
   }
 
   // Save all the MSCKF features used in the update
   for (auto const &feat : featsup_MSCKF) {
     good_features_MSCKF.push_back(feat->p_FinG);
+    FeatToken tok;
+    tok.id = feat->featid;
+    tok.p_FinG = feat->p_FinG;
+    tok.kind = 1;
+    fill_token_stats(tok, feat);
+    good_feature_tokens_MSCKF.push_back(tok);
     feat->to_delete = true;
   }
 

@@ -56,6 +56,7 @@ ROS2Visualizer::ROS2Visualizer(std::shared_ptr<rclcpp::Node> node, std::shared_p
   pub_points_msckf = node->create_publisher<sensor_msgs::msg::PointCloud2>("points_msckf", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_msckf->get_topic_name());
   pub_points_slam = node->create_publisher<sensor_msgs::msg::PointCloud2>("points_slam", 2);
+  pub_feat_tokens = node->create_publisher<sensor_msgs::msg::PointCloud2>("feat_tokens", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_msckf->get_topic_name());
   pub_points_aruco = node->create_publisher<sensor_msgs::msg::PointCloud2>("points_aruco", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_aruco->get_topic_name());
@@ -736,6 +737,45 @@ void ROS2Visualizer::publish_images() {
 void ROS2Visualizer::publish_features() {
 
   // Check if we have subscribers
+  // Feature tokens: SLAM features in the state + MSCKF features of the last
+  // update, each with [x y z kind track_len n_obs cams first_t id]. Stamped
+  // with the STATE time so a bag consumer can pair them with the images.
+  if (pub_feat_tokens->get_subscription_count() > 0) {
+    std::vector<VioManager::FeatToken> toks = _app->get_feature_tokens_SLAM();
+    std::vector<VioManager::FeatToken> toks_m = _app->get_good_feature_tokens_MSCKF();
+    toks.insert(toks.end(), toks_m.begin(), toks_m.end());
+    sensor_msgs::msg::PointCloud2 cloud;
+    cloud.header.frame_id = "global";
+    cloud.header.stamp = rclcpp::Time((int64_t)(_app->get_state()->_timestamp * 1e9));
+    cloud.height = 1;
+    cloud.width = (uint32_t)toks.size();
+    cloud.is_bigendian = false;
+    cloud.is_dense = true;
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2Fields(9, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1, sensor_msgs::msg::PointField::FLOAT32, "z", 1,
+                             sensor_msgs::msg::PointField::FLOAT32, "kind", 1, sensor_msgs::msg::PointField::FLOAT32, "track_len", 1,
+                             sensor_msgs::msg::PointField::FLOAT32, "n_obs", 1, sensor_msgs::msg::PointField::FLOAT32, "cams", 1,
+                             sensor_msgs::msg::PointField::FLOAT32, "first_t", 1, sensor_msgs::msg::PointField::FLOAT64, "id", 1,
+                             sensor_msgs::msg::PointField::FLOAT64);
+    mod.resize(toks.size());
+    sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x"), iy(cloud, "y"), iz(cloud, "z"), ik(cloud, "kind"), it(cloud, "track_len"),
+        in(cloud, "n_obs"), ic(cloud, "cams");
+    sensor_msgs::PointCloud2Iterator<double> ift(cloud, "first_t"), iid(cloud, "id");
+    for (auto const &tok : toks) {
+      *ix = (float)tok.p_FinG(0);
+      *iy = (float)tok.p_FinG(1);
+      *iz = (float)tok.p_FinG(2);
+      *ik = (float)tok.kind;
+      *it = tok.track_len;
+      *in = (float)tok.n_obs;
+      *ic = (float)tok.cams;
+      *ift = tok.first_t;
+      *iid = (double)tok.id;
+      ++ix; ++iy; ++iz; ++ik; ++it; ++in; ++ic; ++ift; ++iid;
+    }
+    pub_feat_tokens->publish(cloud);
+  }
+
   if (pub_points_msckf->get_subscription_count() == 0 && pub_points_slam->get_subscription_count() == 0 &&
       pub_points_aruco->get_subscription_count() == 0 && pub_points_sim->get_subscription_count() == 0)
     return;

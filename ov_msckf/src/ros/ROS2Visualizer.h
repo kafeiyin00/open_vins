@@ -194,6 +194,9 @@ protected:
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;
 
+  /// Triangulated features with track statistics (SLAM + last-update MSCKF), for learned consumers
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_feat_tokens;
+
   // Ring stereo: per-stamp collection of the N camera images
   std::mutex ring_mtx;
   std::map<double, std::map<int, cv::Mat>> ring_buffer;

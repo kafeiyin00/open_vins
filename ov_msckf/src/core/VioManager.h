@@ -32,6 +32,7 @@
 #include <string>
 
 #include "VioManagerOptions.h"
+#include "feat/Feature.h"
 
 namespace ov_core {
 struct ImuData;
@@ -121,6 +122,29 @@ public:
 
   /// Returns 3d features used in the last update in global frame
   std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
+
+  /**
+   * @brief A triangulated feature with the bookkeeping a downstream consumer
+   * (e.g. a learned safe-corridor predictor) wants alongside the 3D point.
+   */
+  struct FeatToken {
+    size_t id = 0;
+    Eigen::Vector3d p_FinG = Eigen::Vector3d::Zero();
+    float track_len = -1;   ///< seconds between first and last observation
+    int n_obs = -1;         ///< total observations over all cameras
+    int cams = 0;           ///< bitmask of camera ids that observed it
+    double first_t = -1;    ///< first observation time
+    int kind = 0;           ///< 0 = SLAM (in state), 1 = MSCKF (used in the last update)
+  };
+
+  /// MSCKF features used in the last update, with track statistics
+  std::vector<FeatToken> get_good_feature_tokens_MSCKF() { return good_feature_tokens_MSCKF; }
+
+  /// SLAM features currently in the state, in the global frame, with track statistics
+  std::vector<FeatToken> get_feature_tokens_SLAM();
+
+  /// Fill the track statistics of a token from a tracked feature
+  static void fill_token_stats(FeatToken &tok, const std::shared_ptr<ov_core::Feature> &feat);
 
   /// Return the image used when projecting the active tracks
   void get_active_image(double &timestamp, cv::Mat &image) {
@@ -231,6 +255,9 @@ protected:
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;
+
+  /// Same features, with the bookkeeping of FeatToken
+  std::vector<FeatToken> good_feature_tokens_MSCKF;
 
   // Re-triangulated features 3d positions seen from the current frame (used in visualization)
   // For each feature we have a linear system A * p_FinG = b we create and increment their costs
