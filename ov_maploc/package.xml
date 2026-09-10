@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+    <name>ov_maploc</name>
+    <version>0.1.0</version>
+    <description>
+        Map reuse for a multi-fisheye rig on top of OpenVINS: relocalization against a prebuilt
+        ORB landmark map from a known start, loosely coupled (OpenVINS is not modified).
+    </description>
+    <maintainer email="lijianping@whu.edu.cn">kafeiyin00</maintainer>
+    <license>GNU General Public License v3.0</license>
+
+    <buildtool_depend>ament_cmake</buildtool_depend>
+    <depend>rclcpp</depend>
+    <depend>std_msgs</depend>
+    <depend>geometry_msgs</depend>
+    <depend>sensor_msgs</depend>
+    <depend>tf2_ros</depend>
+    <depend>cv_bridge</depend>
+    <depend>eigen</depend>
+    <depend>libopencv-dev</depend>
+
+    <export>
+        <build_type>ament_cmake</build_type>
+    </export>
+</package>
