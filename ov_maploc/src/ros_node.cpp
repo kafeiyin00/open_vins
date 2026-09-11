@@ -103,6 +103,10 @@ public:
     p.alpha = declare_parameter<double>("alpha", p.alpha);
     p.good_inliers = declare_parameter<int>("good_inliers", p.good_inliers);
     p.jump_rate = declare_parameter<double>("jump_rate", p.jump_rate);
+    p.reanchor_n = declare_parameter<int>("reanchor_n", p.reanchor_n);
+    p.reanchor_inliers = declare_parameter<int>("reanchor_inliers", p.reanchor_inliers);
+    p.reanchor_tol_m = declare_parameter<double>("reanchor_tol_m", p.reanchor_tol_m);
+    p.reanchor_tol_deg = declare_parameter<double>("reanchor_tol_deg", p.reanchor_tol_deg);
     p.threads = declare_parameter<int>("threads", p.threads);
     if (map_path.empty() || calib.empty())
       throw std::runtime_error("maploc: set the 'map' and 'calib' parameters");
@@ -247,17 +251,21 @@ private:
           n_ok_++;
           last_fix_ = job.stamp;
         }
-        char buf[512];
+        char buf[768];
         std::snprintf(buf, sizeof(buf),
                       "{\"t\": %.3f, \"ok\": %s, \"why\": \"%s\", \"inliers\": %d, \"matches\": %d, \"landmarks\": %d, "
-                      "\"since_fix_s\": %.2f, \"ms\": %.1f, \"ms_orb\": %.1f, \"ms_match\": %.1f, \"ms_pnp\": %.1f, "
+                      "\"since_fix_s\": %.2f, \"jump_m\": %.2f, \"jump_deg\": %.2f, \"reanchor\": %s, "
+                      "\"ms\": %.1f, \"ms_orb\": %.1f, \"ms_match\": %.1f, \"ms_pnp\": %.1f, "
                       "\"tilt_deg\": %.2f, \"fixes\": \"%d/%d\"}",
                       job.stamp, r.ok ? "true" : "false", r.why.c_str(), r.inliers, r.n_corr, r.n_landmarks,
-                      last_fix_ < 0 ? -1.0 : job.stamp - last_fix_, r.t_total * 1e3, r.t_orb * 1e3, r.t_match * 1e3,
-                      r.t_pnp * 1e3, r.tilt_deg, n_ok_, n_try_);
+                      last_fix_ < 0 ? -1.0 : job.stamp - last_fix_, r.jump_m, r.jump_deg, r.reanchor ? "true" : "false",
+                      r.t_total * 1e3, r.t_orb * 1e3, r.t_match * 1e3, r.t_pnp * 1e3, r.tilt_deg, n_ok_, n_try_);
         std_msgs::msg::String st;
         st.data = buf;
         pub_status_->publish(st);
+        if (r.reanchor)
+          RCLCPP_WARN(get_logger(), "re-anchored: %d consistent fixes beyond the jump gate (jump %.2f m, %.1f deg)", loc_->params().reanchor_n,
+                      r.jump_m, r.jump_deg);
         if (!r.ok || n_try_ % 10 == 0)
           RCLCPP_INFO(get_logger(), "%s", buf);
       } catch (const std::exception &e) {

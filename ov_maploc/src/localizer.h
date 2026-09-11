@@ -34,11 +34,16 @@ struct LocParams {
   double alpha = 0.5;            ///< blend of an accepted fix into T_map_odom (first fix: 1) ...
   int good_inliers = 200;        ///< ... scaled down for fixes with fewer inliers (x0.2 at min_inliers)
   double jump_rate = 0.05;       ///< m/s: the jump gate grows by this per second since the last accepted fix
+  int reanchor_n = 3;            ///< re-anchor: this many consecutive gate-rejected fixes that agree with each other ...
+  int reanchor_inliers = 50;     ///< ... each with at least this many inliers ...
+  double reanchor_tol_m = 0.3;   ///< ... and within this of the newest one (T_map_odom translation) ...
+  double reanchor_tol_deg = 3.0; ///< ... and yaw: the VIO slipped, T_map_odom is reset to them (0: off)
   int threads = 1;               ///< cameras processed in parallel (RK3588: up to the free A76 cores)
 };
 
 struct LocResult {
   bool ok = false;
+  bool reanchor = false; ///< accepted by resetting T_map_odom (consistent fixes beyond the jump gate)
   std::string why;
   int n_kf = 0, n_landmarks = 0, n_query = 0, n_corr = 0, inliers = 0;
   double radius = 0, tilt_deg = 0, jump_m = 0, jump_deg = 0;
@@ -84,6 +89,8 @@ private:
   bool started_ = false, locked_ = false;
   int misses_ = 0;
   double last_ok_stamp_ = -1.0;
+  struct Cand { Eigen::Matrix4d T_mo; double stamp; int inliers; };
+  std::vector<Cand> cands_; ///< gate-rejected fixes, for the re-anchor vote
 };
 
 } // namespace ov_maploc

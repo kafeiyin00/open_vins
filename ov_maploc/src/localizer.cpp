@@ -243,8 +243,49 @@ LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Ma
   // drift budget: the longer since the last accepted fix, the larger the correction the VIO may need
   const double since = (stamp >= 0.0 && last_ok_stamp_ >= 0.0) ? std::max(0.0, stamp - last_ok_stamp_) : 0.0;
   const double gate_m = p_.max_jump_m + p_.jump_rate * since;
-  if (locked_ && (r.jump_m > gate_m || r.jump_deg > p_.max_jump_deg + 2.0 * p_.jump_rate * since))
+  if (locked_ && (r.jump_m > gate_m || r.jump_deg > p_.max_jump_deg + 2.0 * p_.jump_rate * since)) {
+    // Re-anchor vote: the VIO may have slipped (a jump of its own) or drifted away while the map was not
+    // visible; then the gate rejects every fix although the map sees the vehicle clearly. Consecutive
+    // rejected fixes that agree with EACH OTHER (the VIO tracks fine again, with an offset) reset T_map_odom.
+    if (p_.reanchor_n > 0 && r.inliers >= p_.reanchor_inliers) {
+      cands_.push_back({T_mo_meas, stamp, r.inliers});
+      if ((int)cands_.size() > p_.reanchor_n)
+        cands_.erase(cands_.begin(), cands_.end() - p_.reanchor_n);
+      bool agree = (int)cands_.size() == p_.reanchor_n;
+      for (const auto &cd : cands_) {
+        const double dm = (cd.T_mo.block<3, 1>(0, 3) - T_mo_meas.block<3, 1>(0, 3)).norm();
+        const double dd = std::abs(wrap_rad(yaw_of(cd.T_mo.block<3, 3>(0, 0)) - yaw_new)) * 180.0 / M_PI;
+        if (dm > p_.reanchor_tol_m || dd > p_.reanchor_tol_deg)
+          agree = false;
+      }
+      if (agree) {
+        Eigen::Vector3d t = Eigen::Vector3d::Zero();
+        double sx = 0, sy = 0;
+        for (const auto &cd : cands_) {
+          t += cd.T_mo.block<3, 1>(0, 3);
+          const double y = yaw_of(cd.T_mo.block<3, 3>(0, 0));
+          sx += std::cos(y);
+          sy += std::sin(y);
+        }
+        {
+          std::lock_guard<std::mutex> lk(mtx_);
+          T_map_odom_ = T_from(Rz(std::atan2(sy, sx)), t / (double)cands_.size());
+        }
+        cands_.clear();
+        misses_ = 0;
+        if (stamp >= 0.0)
+          last_ok_stamp_ = stamp;
+        r.ok = true;
+        r.reanchor = true;
+        r.why = "reanchor";
+        return r;
+      }
+    } else {
+      cands_.clear();
+    }
     return miss(r, "jump too large");
+  }
+  cands_.clear();
   // weak fixes (few inliers) move T_map_odom less
   const double q = std::min(1.0, std::max(0.2, double(r.inliers - p_.min_inliers) / std::max(1, p_.good_inliers - p_.min_inliers)));
   const double a = locked_ ? p_.alpha * q : 1.0;
