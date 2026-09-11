@@ -31,7 +31,9 @@ struct LocParams {
   double max_tilt_deg = 3.0;     ///< PnP tilt vs VIO tilt
   double max_jump_m = 1.5;       ///< once locked: correction change per fix
   double max_jump_deg = 10.0;
-  double alpha = 0.5;            ///< blend of an accepted fix into T_map_odom (first fix: 1)
+  double alpha = 0.5;            ///< blend of an accepted fix into T_map_odom (first fix: 1) ...
+  int good_inliers = 200;        ///< ... scaled down for fixes with fewer inliers (x0.2 at min_inliers)
+  double jump_rate = 0.05;       ///< m/s: the jump gate grows by this per second since the last accepted fix
   int threads = 1;               ///< cameras processed in parallel (RK3588: up to the free A76 cores)
 };
 
@@ -60,7 +62,8 @@ public:
   Eigen::Matrix4d predict(const Eigen::Matrix4d &T_odom_imu) const { return T_map_odom() * T_odom_imu; }
 
   /// One fix from the four fisheye grayscale images and the VIO pose of the same instant.
-  LocResult localize(const std::vector<cv::Mat> &fisheye_grays, const Eigen::Matrix4d &T_odom_imu);
+  /// stamp (s, image time) lets the jump gate grow with the time since the last accepted fix; <0: fixed gate
+  LocResult localize(const std::vector<cv::Mat> &fisheye_grays, const Eigen::Matrix4d &T_odom_imu, double stamp = -1.0);
 
   const RuntimeMap &map() const { return *map_; }
   const LocParams &params() const { return p_; }
@@ -80,6 +83,7 @@ private:
   Eigen::Matrix4d T_map_odom_ = Eigen::Matrix4d::Identity();
   bool started_ = false, locked_ = false;
   int misses_ = 0;
+  double last_ok_stamp_ = -1.0;
 };
 
 } // namespace ov_maploc

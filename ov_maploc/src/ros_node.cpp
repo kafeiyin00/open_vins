@@ -101,6 +101,8 @@ public:
     p.max_jump_m = declare_parameter<double>("max_jump_m", p.max_jump_m);
     p.max_jump_deg = declare_parameter<double>("max_jump_deg", p.max_jump_deg);
     p.alpha = declare_parameter<double>("alpha", p.alpha);
+    p.good_inliers = declare_parameter<int>("good_inliers", p.good_inliers);
+    p.jump_rate = declare_parameter<double>("jump_rate", p.jump_rate);
     p.threads = declare_parameter<int>("threads", p.threads);
     if (map_path.empty() || calib.empty())
       throw std::runtime_error("maploc: set the 'map' and 'calib' parameters");
@@ -239,7 +241,7 @@ private:
         std::vector<cv::Mat> grays;
         for (const auto &m : job.msgs)
           grays.push_back(to_gray(m));
-        const LocResult r = loc_->localize(grays, job.T_odom_imu);
+        const LocResult r = loc_->localize(grays, job.T_odom_imu, job.stamp);
         n_try_++;
         if (r.ok) {
           n_ok_++;

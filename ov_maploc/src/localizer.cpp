@@ -149,7 +149,7 @@ std::vector<Obs> Localizer::match_camera(int ci, const cv::Mat &gray, const Eige
   return out;
 }
 
-LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Matrix4d &T_odom_imu) {
+LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Matrix4d &T_odom_imu, double stamp) {
   const RuntimeMap &m = *map_;
   LocResult r;
   const double t0 = now_s();
@@ -240,15 +240,22 @@ LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Ma
   const double dyaw = wrap_rad(yaw_new - yaw_old);
   r.jump_m = (T_mo_meas.block<3, 1>(0, 3) - T_mo.block<3, 1>(0, 3)).norm();
   r.jump_deg = std::abs(dyaw) * 180.0 / M_PI;
-  if (locked_ && (r.jump_m > p_.max_jump_m || r.jump_deg > p_.max_jump_deg))
+  // drift budget: the longer since the last accepted fix, the larger the correction the VIO may need
+  const double since = (stamp >= 0.0 && last_ok_stamp_ >= 0.0) ? std::max(0.0, stamp - last_ok_stamp_) : 0.0;
+  const double gate_m = p_.max_jump_m + p_.jump_rate * since;
+  if (locked_ && (r.jump_m > gate_m || r.jump_deg > p_.max_jump_deg + 2.0 * p_.jump_rate * since))
     return miss(r, "jump too large");
-  const double a = locked_ ? p_.alpha : 1.0;
+  // weak fixes (few inliers) move T_map_odom less
+  const double q = std::min(1.0, std::max(0.2, double(r.inliers - p_.min_inliers) / std::max(1, p_.good_inliers - p_.min_inliers)));
+  const double a = locked_ ? p_.alpha * q : 1.0;
   {
     std::lock_guard<std::mutex> lk(mtx_);
     T_map_odom_ = T_from(Rz(yaw_old + a * dyaw), (1 - a) * T_mo.block<3, 1>(0, 3) + a * T_mo_meas.block<3, 1>(0, 3));
   }
   locked_ = true;
   misses_ = 0;
+  if (stamp >= 0.0)
+    last_ok_stamp_ = stamp;
   r.ok = true;
   return r;
 }
