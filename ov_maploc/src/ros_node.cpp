@@ -83,7 +83,7 @@ public:
     const std::string masks = declare_parameter<std::string>("masks", "");
     pose_topic_ = declare_parameter<std::string>("pose_topic", "/ov_msckf/poseimu");
     const double reloc_hz = declare_parameter<double>("reloc_hz", 1.0);
-    start_ = declare_parameter<std::string>("start", ""); // "x,y,yaw_deg" of the first VIO pose in the map
+    start_ = declare_parameter<std::string>("start", ""); // "x,y,yaw_deg" or "x,y,z,yaw_deg" of the first VIO pose in the map
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "global");
     LocParams p;
@@ -174,12 +174,15 @@ private:
     if (!loc_->started()) {
       Eigen::Matrix4d T_map_imu0 = loc_->map().start_T_map_imu;
       if (!start_.empty()) {
-        double x = 0, y = 0, yaw = 0;
-        char c1, c2;
+        std::vector<double> v;
+        std::string tok;
         std::istringstream ss(start_);
-        if (!(ss >> x >> c1 >> y >> c2 >> yaw))
-          throw std::runtime_error("maploc: start must be 'x,y,yaw_deg'");
-        T_map_imu0 = T_from(Rz(yaw * M_PI / 180.0), Eigen::Vector3d(x, y, T_map_imu0(2, 3)));
+        while (std::getline(ss, tok, ','))
+          v.push_back(std::stod(tok));
+        if (v.size() != 3 && v.size() != 4)
+          throw std::runtime_error("maploc: start must be 'x,y,yaw_deg' or 'x,y,z,yaw_deg'");
+        const double z = v.size() == 4 ? v[2] : T_map_imu0(2, 3);
+        T_map_imu0 = T_from(Rz(v.back() * M_PI / 180.0), Eigen::Vector3d(v[0], v[1], z));
       }
       loc_->set_start(T_map_imu0 * T_inv(T));
       RCLCPP_INFO(get_logger(), "known start set from the first VIO pose");
