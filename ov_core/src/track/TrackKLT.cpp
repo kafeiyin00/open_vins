@@ -1233,7 +1233,7 @@ const std::pair<cv::Mat, cv::Mat> &TrackKLT::get_ring_map(size_t cam_id_left, si
     if (f && f.read((char *)hdr, sizeof(hdr)) && hdr[0] == rows && hdr[1] == cols) {
       cv::Mat mx(rows, cols, CV_32FC1), my(rows, cols, CV_32FC1);
       if (f.read((char *)mx.data, sizeof(float) * rows * cols) && f.read((char *)my.data, sizeof(float) * rows * cols)) {
-        PRINT_INFO("[RING]: loaded remap cam%zu->cam%zu from %s\n", cam_id_left, cam_id_right, cache_path.c_str());
+        PRINT_WARNING("[RING]: loaded remap cam%zu->cam%zu from %s\n", cam_id_left, cam_id_right, cache_path.c_str());   // visible at verbosity WARNING
         ring_maps[key] = std::make_pair(mx, my);
         return ring_maps.at(key);
       }
@@ -1262,15 +1262,16 @@ const std::pair<cv::Mat, cv::Mat> &TrackKLT::get_ring_map(size_t cam_id_left, si
     }
   }
   auto t1 = boost::posix_time::microsec_clock::local_time();
-  PRINT_INFO("[RING]: built remap cam%zu->cam%zu view in %.2f s\n", cam_id_left, cam_id_right, (t1 - t0).total_microseconds() * 1e-6);
+  PRINT_WARNING("[RING]: built remap cam%zu->cam%zu view in %.2f s (no cache hit)\n", cam_id_left, cam_id_right, (t1 - t0).total_microseconds() * 1e-6);
   if (!cache_path.empty()) {
     std::ofstream f(cache_path, std::ios::binary);
     const int32_t hdr[2] = {rows, cols};
     if (f && f.write((const char *)hdr, sizeof(hdr)) && f.write((const char *)mapx.data, sizeof(float) * rows * cols) &&
-        f.write((const char *)mapy.data, sizeof(float) * rows * cols))
-      PRINT_INFO("[RING]: cached remap to %s\n", cache_path.c_str());
-    else
+        f.write((const char *)mapy.data, sizeof(float) * rows * cols)) {
+      PRINT_WARNING("[RING]: cached remap cam%zu->cam%zu to %s\n", cam_id_left, cam_id_right, cache_path.c_str());
+    } else {
       PRINT_WARNING("[RING]: could not write %s\n", cache_path.c_str());
+    }
   }
   ring_maps[key] = std::make_pair(mapx, mapy);
   return ring_maps.at(key);
