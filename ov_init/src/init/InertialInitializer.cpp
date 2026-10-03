@@ -121,12 +121,10 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
     int feat_thresh = 15;
     if (num_features0 < feat_thresh || num_features1 < feat_thresh) {
       PRINT_WARNING(YELLOW "[init]: not enough feats to compute disp: %d,%d < %d\n" RESET, num_features0, num_features1, feat_thresh);
-      // Too little tracked to judge motion by disparity (start-up, a dark or bare scene). When a still start
-      // is all we wait for (ZUPT on, no jerk needed), let the IMU judge it: the static initializer checks the
-      // accelerometer variance itself and fails on a moving platform. Else this would wait for features.
-      if (wait_for_jerk || params.init_imu_thresh <= 0.0)
-        return false;
-      return init_static->initialize(timestamp, covariance, order, t_imu, false);
+      // Wait for the disparity even for a still start: the accelerometer cannot tell still from turning
+      // (hand-held starts of our rig turning at 12-60 deg/s show 0.1-0.7 m/s^2 of std, under any usable
+      // init_imu_thresh), and a static init on a turning rig diverges. Without features there is no VIO anyway.
+      return false;
     }
 
     // Check if it passed our check!
