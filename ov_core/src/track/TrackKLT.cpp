@@ -37,6 +37,20 @@
 
 using namespace ov_core;
 
+// Per-cell feature budget of the grid extraction, and the downsampled mask that
+// says which cells to skip. A cell is skipped only when the mask covers all of it
+// (its INTER_AREA average is 255): Grider_GRID checks the mask per pixel, so cells
+// the mask edge crosses can still give features. The budget is spread over the
+// open cells only, else a mask that hides most of the image (fisheye, keeping a
+// central disc) leaves a handful of features per camera -- below the 10 that
+// RANSAC needs, so tracking never starts. Without a mask this is the stock
+// num_features / (grid_x * grid_y) + 1.
+static int grid_budget(const cv::Mat &mask, const cv::Size &size_grid, int num_features, cv::Mat &mask_grid) {
+  cv::resize(mask, mask_grid, size_grid, 0.0, 0.0, cv::INTER_AREA);
+  int open = std::max(1, cv::countNonZero(mask_grid != 255));
+  return (int)((double)num_features / (double)open) + 1;
+}
+
 void TrackKLT::feed_new_camera(const CameraData &message) {
 
   // Error check that we have all the data
@@ -485,10 +499,9 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
 
   // We also check a downsampled mask such that we don't extract in areas where it is all masked!
   cv::Mat mask0_grid;
-  cv::resize(mask0, mask0_grid, size_grid, 0.0, 0.0, cv::INTER_NEAREST);
+  int num_features_grid = grid_budget(mask0, size_grid, num_features, mask0_grid);
 
   // Create grids we need to extract from and then extract our features (use fast with griding)
-  int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
   int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
   std::vector<std::pair<int, int>> valid_locs;
   for (int x = 0; x < grid_2d_grid.cols; x++) {
@@ -623,10 +636,9 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
 
     // We also check a downsampled mask such that we don't extract in areas where it is all masked!
     cv::Mat mask0_grid;
-    cv::resize(mask0, mask0_grid, size_grid0, 0.0, 0.0, cv::INTER_NEAREST);
+    int num_features_grid = grid_budget(mask0, size_grid0, num_features, mask0_grid);
 
     // Create grids we need to extract from and then extract our features (use fast with griding)
-    int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
     int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
     std::vector<std::pair<int, int>> valid_locs;
     for (int x = 0; x < grid_2d_grid0.cols; x++) {
@@ -799,10 +811,9 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
 
     // We also check a downsampled mask such that we don't extract in areas where it is all masked!
     cv::Mat mask1_grid;
-    cv::resize(mask1, mask1_grid, size_grid1, 0.0, 0.0, cv::INTER_NEAREST);
+    int num_features_grid = grid_budget(mask1, size_grid1, num_features, mask1_grid);
 
     // Create grids we need to extract from and then extract our features (use fast with griding)
-    int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
     int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
     std::vector<std::pair<int, int>> valid_locs;
     for (int x = 0; x < grid_2d_grid1.cols; x++) {
@@ -922,10 +933,9 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
 
     // We also check a downsampled mask such that we don't extract in areas where it is all masked!
     cv::Mat mask0_grid;
-    cv::resize(mask0, mask0_grid, size_grid0, 0.0, 0.0, cv::INTER_NEAREST);
+    int num_features_grid = grid_budget(mask0, size_grid0, num_features, mask0_grid);
 
     // Create grids we need to extract from and then extract our features (use fast with griding)
-    int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
     int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
     std::vector<std::pair<int, int>> valid_locs;
     for (int x = 0; x < grid_2d_grid0.cols; x++) {
@@ -1180,10 +1190,9 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
 
     // We also check a downsampled mask such that we don't extract in areas where it is all masked!
     cv::Mat mask1_grid;
-    cv::resize(mask1, mask1_grid, size_grid1, 0.0, 0.0, cv::INTER_NEAREST);
+    int num_features_grid = grid_budget(mask1, size_grid1, num_features, mask1_grid);
 
     // Create grids we need to extract from and then extract our features (use fast with griding)
-    int num_features_grid = (int)((double)num_features / (double)(grid_x * grid_y)) + 1;
     int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
     std::vector<std::pair<int, int>> valid_locs;
     for (int x = 0; x < grid_2d_grid1.cols; x++) {
