@@ -36,14 +36,22 @@ struct RuntimeMap {
   double orb_scale_factor = 1.2;
   int orb_n_levels = 8, orb_edge_threshold = 31, orb_patch_size = 31, orb_fast_threshold = 10, orb_grid = 8;
   int orb_n_features_map = 0;
-  std::vector<std::array<double, 5>> rig_fisheye; ///< f, cx, cy, width, height per camera
+  std::vector<std::array<double, 10>> rig_fisheye; ///< per camera: FisheyeCam::model() (fx fy cx cy k1-k4 width height)
   std::vector<Eigen::Matrix4d> rig_T_imu_cam;
+  // optional, for display only (the localizer does not load them): each keyframe view as a JPEG of
+  // thumb_size^2 px, image k*C + c (keyframe k, camera c) in kf_thumbs[kf_thumbs_ptr[i] .. kf_thumbs_ptr[i+1])
+  int thumb_size = 0;
+  std::vector<uint8_t> kf_thumbs;
+  std::vector<int32_t> kf_thumbs_ptr;
   bool has_T_world_map = false;
   Eigen::Matrix4d T_world_map = Eigen::Matrix4d::Identity(); ///< simulation only, for evaluation
   std::string meta_json;
 
-  /// Throws std::runtime_error on a missing/garbled file.
+  /// Throws std::runtime_error on a missing/garbled file. Reads version 1
+  /// (map_npz_to_bin.py: ideal fisheyes, f cx cy per camera) and 2 (save()).
   static RuntimeMap load(const std::string &path);
+  /// Writes version 2: the full fisheye model per camera (rig_fisheye_kb4).
+  void save(const std::string &path) const;
 
   size_t num_points() const { return points_xyz.size(); }
   size_t num_keyframes() const { return kf_stamp.size(); }

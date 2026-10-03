@@ -4,6 +4,7 @@
  */
 #include "map.h"
 
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -76,7 +77,7 @@ RuntimeMap RuntimeMap::load(const std::string &path) {
     throw std::runtime_error("map: " + path + " is not an ov_maploc map (convert map.npz with map_npz_to_bin.py)");
   uint32_t version = 0, n = 0;
   read_pod(f, version);
-  if (version != 1)
+  if (version != 1 && version != 2)
     throw std::runtime_error("map: unsupported version " + std::to_string(version));
   read_pod(f, n);
   std::map<std::string, Raw> arr;
@@ -94,6 +95,10 @@ RuntimeMap RuntimeMap::load(const std::string &path) {
     r.shape.resize(ndim);
     for (auto &s : r.shape)
       read_pod(f, s);
+    if (name == "kf_thumbs") { // display only: not kept in memory
+      f.seekg((std::streamoff)(r.count() * dtype_size(r.dtype)), std::ios::cur);
+      continue;
+    }
     r.data.resize(r.count() * dtype_size(r.dtype));
     f.read(r.data.data(), (std::streamsize)r.data.size());
     if (!f)
@@ -155,9 +160,18 @@ RuntimeMap RuntimeMap::load(const std::string &path) {
   m.orb_fast_threshold = (int)orb.at(4);
   m.orb_grid = (int)orb.at(5);
   m.orb_n_features_map = as_vec<int32_t>(get("orb_n_features_map"), 3, "orb_n_features_map").at(0);
-  auto fe = as_vec<double>(get("rig_fisheye"), 5, "rig_fisheye");
-  for (size_t i = 0; i + 5 <= fe.size(); i += 5)
-    m.rig_fisheye.push_back({fe[i], fe[i + 1], fe[i + 2], fe[i + 3], fe[i + 4]});
+  if (arr.count("rig_fisheye_kb4")) {
+    auto fe = as_vec<double>(get("rig_fisheye_kb4"), 5, "rig_fisheye_kb4");
+    for (size_t i = 0; i + 10 <= fe.size(); i += 10) {
+      std::array<double, 10> c;
+      std::copy(fe.begin() + i, fe.begin() + i + 10, c.begin());
+      m.rig_fisheye.push_back(c);
+    }
+  } else { // version 1: f cx cy width height of an ideal r = f theta fisheye
+    auto fe = as_vec<double>(get("rig_fisheye"), 5, "rig_fisheye");
+    for (size_t i = 0; i + 5 <= fe.size(); i += 5)
+      m.rig_fisheye.push_back({fe[i], fe[i], fe[i + 1], fe[i + 2], 0, 0, 0, 0, fe[i + 3], fe[i + 4]});
+  }
   m.rig_T_imu_cam = as_mat4(get("rig_T_imu_cam"), "rig_T_imu_cam");
   if (arr.count("T_world_map")) {
     m.has_T_world_map = true;
@@ -168,6 +182,107 @@ RuntimeMap RuntimeMap::load(const std::string &path) {
     m.meta_json = std::string(j.data.data(), j.data.size());
   }
   return m;
+}
+
+namespace {
+
+struct OutArray {
+  std::string name;
+  uint8_t dtype;
+  std::vector<uint64_t> shape;
+  std::vector<char> data;
+};
+
+template <class T> OutArray out_array(const std::string &name, uint8_t dtype, std::vector<uint64_t> shape, const T *p, size_t n) {
+  OutArray o{name, dtype, std::move(shape), std::vector<char>(n * sizeof(T))};
+  if (n)
+    std::memcpy(o.data.data(), p, o.data.size());
+  return o;
+}
+
+std::vector<double> rows_of(const std::vector<Eigen::Matrix4d> &Ts) {
+  std::vector<double> v;
+  for (const auto &T : Ts)
+    for (int r = 0; r < 4; r++)
+      for (int c = 0; c < 4; c++)
+        v.push_back(T(r, c));
+  return v;
+}
+
+} // namespace
+
+void RuntimeMap::save(const std::string &path) const {
+  const uint64_t N = points_xyz.size(), M = (uint64_t)desc.rows, K = kf_stamp.size(), C = rig_fisheye.size();
+  if (points_err.size() != N || points_track.size() != N || desc_point.size() != M || kf_T_map_imu.size() != K ||
+      kf_vis_ptr.size() != K + 1 || rig_T_imu_cam.size() != C || (M && (desc.cols != 32 || desc.type() != CV_8U)))
+    throw std::runtime_error("map: inconsistent arrays, not saving " + path);
+  std::vector<float> xyz;
+  for (const auto &p : points_xyz)
+    for (int i = 0; i < 3; i++)
+      xyz.push_back((float)p(i));
+  const cv::Mat d = desc.isContinuous() ? desc : desc.clone();
+  std::vector<double> fe;
+  for (const auto &c : rig_fisheye)
+    fe.insert(fe.end(), c.begin(), c.end());
+  const std::vector<double> kfT = rows_of(kf_T_map_imu), rigT = rows_of(rig_T_imu_cam), start = rows_of({start_T_map_imu});
+  const double view[2] = {(double)view_size, view_fov_deg};
+  const double orb[6] = {orb_scale_factor, (double)orb_n_levels, (double)orb_edge_threshold, (double)orb_patch_size,
+                         (double)orb_fast_threshold, (double)orb_grid};
+  std::vector<OutArray> a;
+  a.push_back(out_array("points_xyz", 4, {N, 3}, xyz.data(), xyz.size()));
+  a.push_back(out_array("points_err", 4, {N}, points_err.data(), N));
+  a.push_back(out_array("points_track", 2, {N}, points_track.data(), N));
+  a.push_back(out_array("desc", 1, {M, 32}, d.data, (size_t)(M * 32)));
+  a.push_back(out_array("desc_point", 3, {M}, desc_point.data(), M));
+  a.push_back(out_array("kf_stamp", 5, {K}, kf_stamp.data(), K));
+  a.push_back(out_array("kf_T_map_imu", 5, {K, 4, 4}, kfT.data(), kfT.size()));
+  a.push_back(out_array("kf_vis_ptr", 3, {K + 1}, kf_vis_ptr.data(), K + 1));
+  a.push_back(out_array("kf_vis_idx", 3, {(uint64_t)kf_vis_idx.size()}, kf_vis_idx.data(), kf_vis_idx.size()));
+  a.push_back(out_array("start_T_map_imu", 5, {4, 4}, start.data(), 16));
+  a.push_back(out_array("view", 5, {2}, view, 2));
+  a.push_back(out_array("orb", 5, {6}, orb, 6));
+  a.push_back(out_array("orb_n_features_map", 3, {1}, &orb_n_features_map, 1));
+  a.push_back(out_array("rig_fisheye_kb4", 5, {C, 10}, fe.data(), fe.size()));
+  a.push_back(out_array("rig_T_imu_cam", 5, {C, 4, 4}, rigT.data(), rigT.size()));
+  if (has_T_world_map) {
+    const std::vector<double> w = rows_of({T_world_map});
+    a.push_back(out_array("T_world_map", 5, {4, 4}, w.data(), 16));
+  }
+  if (!kf_thumbs.empty()) {
+    a.push_back(out_array("kf_thumbs", 1, {(uint64_t)kf_thumbs.size()}, kf_thumbs.data(), kf_thumbs.size()));
+    a.push_back(out_array("kf_thumbs_ptr", 3, {(uint64_t)kf_thumbs_ptr.size()}, kf_thumbs_ptr.data(), kf_thumbs_ptr.size()));
+    const int32_t ts = thumb_size;
+    a.push_back(out_array("thumb_size", 3, {1}, &ts, 1));
+  }
+  a.push_back(out_array("meta_json", 1, {(uint64_t)meta_json.size()}, meta_json.data(), meta_json.size()));
+
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary);
+    if (!f)
+      throw std::runtime_error("map: cannot write " + tmp);
+    const uint32_t version = 2, n = (uint32_t)a.size();
+    f.write("OVMAPLOC", 8);
+    f.write(reinterpret_cast<const char *>(&version), 4);
+    f.write(reinterpret_cast<const char *>(&n), 4);
+    for (const auto &o : a) {
+      const uint32_t len = (uint32_t)o.name.size();
+      const uint8_t ndim = (uint8_t)o.shape.size();
+      const uint16_t pad = 0;
+      f.write(reinterpret_cast<const char *>(&len), 4);
+      f.write(o.name.data(), len);
+      f.write(reinterpret_cast<const char *>(&o.dtype), 1);
+      f.write(reinterpret_cast<const char *>(&ndim), 1);
+      f.write(reinterpret_cast<const char *>(&pad), 2);
+      for (uint64_t s : o.shape)
+        f.write(reinterpret_cast<const char *>(&s), 8);
+      f.write(o.data.data(), (std::streamsize)o.data.size());
+    }
+    if (!f)
+      throw std::runtime_error("map: write failed " + tmp);
+  }
+  if (std::rename(tmp.c_str(), path.c_str()) != 0)
+    throw std::runtime_error("map: cannot rename " + tmp + " to " + path);
 }
 
 } // namespace ov_maploc

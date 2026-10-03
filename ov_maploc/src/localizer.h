@@ -39,17 +39,28 @@ struct LocParams {
   double reanchor_tol_m = 0.3;   ///< ... and within this of the newest one (T_map_odom translation) ...
   double reanchor_tol_deg = 3.0; ///< ... and yaw: the VIO slipped, T_map_odom is reset to them (0: off)
   int threads = 1;               ///< cameras processed in parallel (RK3588: up to the free A76 cores)
+  /// Before the first fix the prediction rests on a start pose that may be off by metres and any yaw (the
+  /// rig was not put where the mapping run started): search without the orientation gate (the pose solver
+  /// needs only gravity), and from the third miss on walk the whole map, kf_max keyframes at a time ...
+  bool debug = false;            ///< keep each attempt's views and 2D-3D matches in the result (diagnostics)
+  bool search_global = true;
+  int search_min_inliers = 40;   ///< ... accepting a fix found that way only with this many inliers
 };
 
 struct LocResult {
   bool ok = false;
   bool reanchor = false; ///< accepted by resetting T_map_odom (consistent fixes beyond the jump gate)
+  bool search = false;   ///< before the first fix: no orientation gate (and the map walked, radius < 0)
   std::string why;
   int n_kf = 0, n_landmarks = 0, n_query = 0, n_corr = 0, inliers = 0;
   double radius = 0, tilt_deg = 0, jump_m = 0, jump_deg = 0;
   Eigen::Matrix4d T_pred = Eigen::Matrix4d::Identity(); ///< predicted IMU pose in the map
   Eigen::Matrix4d T_meas = Eigen::Matrix4d::Identity(); ///< measured IMU pose in the map (when PnP ran)
   double t_select = 0, t_orb = 0, t_match = 0, t_pnp = 0, t_total = 0; ///< seconds (t_orb/t_match summed over cameras)
+  // LocParams::debug only: the views the cameras were matched in, every 2D-3D match and which were inliers
+  std::vector<cv::Mat> views;
+  std::vector<Obs> obs;
+  std::vector<uint8_t> inlier;
 };
 
 /// Relocalization against a RuntimeMap with a known start (see ov_maploc/README.md).
@@ -75,7 +86,7 @@ public:
 
 private:
   std::vector<Obs> match_camera(int ci, const cv::Mat &gray, const Eigen::Matrix4d &T_pred, const std::vector<int> &lm,
-                                double &t_orb, int &n_query) const;
+                                bool gate, double &t_orb, int &n_query, cv::Mat *view_out = nullptr) const;
   LocResult miss(LocResult r, const std::string &why);
 
   std::shared_ptr<const RuntimeMap> map_;

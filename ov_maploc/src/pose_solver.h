@@ -16,6 +16,7 @@ struct Obs {
   int cam = 0;
   Eigen::Vector2d uv;  ///< pixel, OpenCV convention, in the camera's pinhole view
   Eigen::Vector3d X;   ///< landmark in the map
+  int lid = -1;        ///< landmark index in the map (diagnostics)
 };
 
 /// Rig of pinhole views sharing one intrinsic (all virtual views have the same spec).

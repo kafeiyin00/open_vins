@@ -5,6 +5,7 @@
 #include "rig.h"
 
 #include <cmath>
+#include <fstream>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <stdexcept>
@@ -30,16 +31,14 @@ std::vector<FisheyeCam> load_ring(const std::string &kalibr_yaml, const std::str
     n["distortion_coeffs"] >> dist;
     n["resolution"] >> res;
     n["rostopic"] >> c.topic;
-    if (model != "equidistant" || intr.size() != 4 || res.size() != 2)
-      throw std::runtime_error("rig: " + c.name + " must be a pure equidistant fisheye");
-    for (double k : dist)
-      if (k != 0.0)
-        throw std::runtime_error("rig: " + c.name + " has distortion coefficients, only r = f*theta is supported");
-    if (std::abs(intr[0] - intr[1]) > 1e-9)
-      throw std::runtime_error("rig: " + c.name + " fu != fv");
-    c.f = intr[0];
+    if (model != "equidistant" || intr.size() != 4 || res.size() != 2 || (!dist.empty() && dist.size() != 4))
+      throw std::runtime_error("rig: " + c.name + " must be an equidistant fisheye (4 intrinsics, 0 or 4 distortion coefficients)");
+    c.fx = intr[0];
+    c.fy = intr[1];
     c.cx = intr[2];
     c.cy = intr[3];
+    for (size_t j = 0; j < dist.size(); j++)
+      c.k[j] = dist[j];
     c.width = res[0];
     c.height = res[1];
     cv::FileNode T = n["T_imu_cam"];
@@ -55,9 +54,17 @@ std::vector<FisheyeCam> load_ring(const std::string &kalibr_yaml, const std::str
     if (r != 4)
       throw std::runtime_error("rig: " + c.name + " T_imu_cam is not 4x4");
     if (!mask_dir.empty()) {
-      c.mask = cv::imread(mask_dir + "/" + c.name + ".png", cv::IMREAD_GRAYSCALE);
+      std::string path = mask_dir + "/" + c.name + ".png";
+      if (!std::ifstream(path)) {
+        // the OpenVINS config directory: mask_<label>.png, label = first topic component
+        std::string label = c.topic.substr(c.topic.find_first_not_of('/'));
+        label = label.substr(0, label.find('/'));
+        if (std::ifstream(mask_dir + "/mask_" + label + ".png"))
+          path = mask_dir + "/mask_" + label + ".png";
+      }
+      c.mask = cv::imread(path, cv::IMREAD_GRAYSCALE);
       if (c.mask.empty() || c.mask.cols != c.width || c.mask.rows != c.height)
-        throw std::runtime_error("rig: bad mask " + mask_dir + "/" + c.name + ".png");
+        throw std::runtime_error("rig: no usable mask for " + c.name + " in " + mask_dir + " (" + c.name + ".png or mask_<label>.png)");
     }
     cams.push_back(c);
   }
@@ -77,8 +84,10 @@ VirtualView::VirtualView(const FisheyeCam &cam, int n, double fov_deg) : size(n)
     for (int u = 0; u < n; u++) {
       const double x = (u + 0.5 - c) / f, y = (v + 0.5 - c) / f;
       const double rho = std::hypot(x, y);
-      const double scale = rho > 1e-12 ? cam.f * std::atan(rho) / rho : cam.f;
-      const float mx = (float)(cam.cx + x * scale), my = (float)(cam.cy + y * scale);
+      const double th = std::atan(rho), th2 = th * th;
+      const double thd = th * (1 + th2 * (cam.k[0] + th2 * (cam.k[1] + th2 * (cam.k[2] + th2 * cam.k[3]))));
+      const double scale = rho > 1e-12 ? thd / rho : 1.0;
+      const float mx = (float)(cam.cx + cam.fx * x * scale), my = (float)(cam.cy + cam.fy * y * scale);
       mapx_.at<float>(v, u) = mx;
       mapy_.at<float>(v, u) = my;
       usable.at<uint8_t>(v, u) = (mx >= 0 && mx <= cam.width - 1 && my >= 0 && my <= cam.height - 1) ? 255 : 0;

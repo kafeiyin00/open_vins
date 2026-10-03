@@ -36,9 +36,12 @@ inline Eigen::Matrix4d to_4dof(const Eigen::Matrix4d &T) {
   return T_from(Rz(yaw_of(T.block<3, 3>(0, 0))), T.block<3, 1>(0, 3));
 }
 
-/// Angle between the z axes (gravity direction) of two orientations, degrees.
+/// Angle between the gravity directions (the world z axis) as seen in the body frame of two
+/// orientations R_world_body, degrees: their difference in tilt, whatever their yaw. (Comparing the
+/// body z axes in the world instead mixes in the yaw: two poses with the same small tilt and yaws 90 deg
+/// apart differ by up to twice the tilt.)
 inline double tilt_deg(const Eigen::Matrix3d &Ra, const Eigen::Matrix3d &Rb) {
-  const double c = std::max(-1.0, std::min(1.0, Ra.col(2).dot(Rb.col(2))));
+  const double c = std::max(-1.0, std::min(1.0, Ra.row(2).dot(Rb.row(2))));
   return std::acos(c) * 180.0 / M_PI;
 }
 

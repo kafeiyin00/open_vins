@@ -29,9 +29,15 @@ Localizer::Localizer(std::shared_ptr<const RuntimeMap> map, const std::vector<Fi
     throw std::runtime_error("localizer: map has " + std::to_string(m.rig_T_imu_cam.size()) + " cameras, calibration " +
                              std::to_string(cams.size()));
   for (size_t i = 0; i < cams.size(); i++) {
+    // Tolerances by what each number is: the same Kalibr result reaches the map (PC) and the
+    // board through different text formatting (the board keeps 10 significant digits), which
+    // can move a focal length or principal point by 1e-6 px; a different calibration moves
+    // them by tenths of a pixel.
     const auto &f = m.rig_fisheye[i];
-    const bool intr_ok = std::abs(f[0] - cams[i].f) < 1e-6 && std::abs(f[1] - cams[i].cx) < 1e-6 &&
-                         std::abs(f[2] - cams[i].cy) < 1e-6 && (int)f[3] == cams[i].width && (int)f[4] == cams[i].height;
+    const auto c = cams[i].model();
+    bool intr_ok = true;
+    for (int j = 0; j < 10; j++)
+      intr_ok = intr_ok && std::abs(f[j] - c[j]) < (j < 4 ? 1e-3 : j < 8 ? 1e-6 : 0.5);
     if (!intr_ok || (m.rig_T_imu_cam[i] - cams[i].T_imu_cam).cwiseAbs().maxCoeff() > 1e-6)
       throw std::runtime_error("localizer: " + cams[i].name + " calibration differs from the one the map was built with");
   }
@@ -79,11 +85,13 @@ LocResult Localizer::miss(LocResult r, const std::string &why) {
 }
 
 std::vector<Obs> Localizer::match_camera(int ci, const cv::Mat &gray, const Eigen::Matrix4d &T_pred,
-                                         const std::vector<int> &lm, double &t_orb, int &n_query) const {
+                                         const std::vector<int> &lm, bool gate, double &t_orb, int &n_query, cv::Mat *view_out) const {
   const RuntimeMap &m = *map_;
   std::vector<Obs> out;
   const double ta = now_s();
   const cv::Mat vg = views_[ci].render(gray);
+  if (view_out)
+    *view_out = vg;
   std::vector<cv::KeyPoint> kps;
   cv::Mat desc;
   orbs_[ci].extract(vg, views_[ci].mask, kps, desc);
@@ -101,7 +109,7 @@ std::vector<Obs> Localizer::match_camera(int ci, const cv::Mat &gray, const Eige
   for (int lid : lm) {
     const Eigen::Vector3d pc = R * m.points_xyz[lid] + t;
     const double rng = pc.norm();
-    if (pc.z() > 0.1 && pc.z() / std::max(rng, 1e-9) > cos_gate_[ci]) {
+    if (!gate || (pc.z() > 0.1 && pc.z() / std::max(rng, 1e-9) > cos_gate_[ci])) {
       for (int k = m.point_desc_ptr[lid]; k < m.point_desc_ptr[lid + 1]; k++) {
         rows.push_back(m.point_desc_rows[k]);
         rows_lid.push_back(lid);
@@ -144,6 +152,7 @@ std::vector<Obs> Localizer::match_camera(int ci, const cv::Mat &gray, const Eige
     o.cam = ci;
     o.uv = Eigen::Vector2d(kps[kv.second.first].pt.x, kps[kv.second.first].pt.y);
     o.X = m.points_xyz[kv.first];
+    o.lid = kv.first;
     out.push_back(o);
   }
   return out;
@@ -161,17 +170,28 @@ LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Ma
   r.T_pred = T_mo * T_odom_imu;
   const Eigen::Vector3d p_pred = r.T_pred.block<3, 1>(0, 3);
 
-  // candidate landmarks: seen by the map keyframes nearest to the prediction
-  r.radius = std::min(p_.kf_radius * std::pow(1.5, misses_), p_.kf_radius_max);
+  // candidate landmarks: seen by the map keyframes nearest to the prediction; before the first fix, from
+  // the third miss on, kf_max consecutive keyframes of the map at a time instead (the prediction is not
+  // trusted, and consecutive keyframes see one place)
+  r.search = p_.search_global && !locked_;
   std::vector<std::pair<double, int>> near;
-  for (size_t k = 0; k < m.kf_T_map_imu.size(); k++) {
-    const double d = (m.kf_T_map_imu[k].block<3, 1>(0, 3) - p_pred).norm();
-    if (d <= r.radius)
-      near.emplace_back(d, (int)k);
-  }
-  if (near.size() > (size_t)p_.kf_max) {
-    std::partial_sort(near.begin(), near.begin() + p_.kf_max, near.end());
-    near.resize(p_.kf_max);
+  if (r.search && misses_ >= 2) {
+    const int K = (int)m.kf_T_map_imu.size(), n = std::max(1, p_.kf_max);
+    const int w = (misses_ - 2) % ((K + n - 1) / n);
+    for (int k = w * n; k < std::min(K, (w + 1) * n); k++)
+      near.emplace_back(0.0, k);
+    r.radius = -1;
+  } else {
+    r.radius = std::min(p_.kf_radius * std::pow(1.5, misses_), p_.kf_radius_max);
+    for (size_t k = 0; k < m.kf_T_map_imu.size(); k++) {
+      const double d = (m.kf_T_map_imu[k].block<3, 1>(0, 3) - p_pred).norm();
+      if (d <= r.radius)
+        near.emplace_back(d, (int)k);
+    }
+    if (near.size() > (size_t)p_.kf_max) {
+      std::partial_sort(near.begin(), near.begin() + p_.kf_max, near.end());
+      near.resize(p_.kf_max);
+    }
   }
   r.n_kf = (int)near.size();
   if (near.empty())
@@ -191,15 +211,16 @@ LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Ma
   std::vector<std::vector<Obs>> per(C);
   std::vector<double> t_orb(C, 0);
   std::vector<int> nq(C, 0);
+  std::vector<cv::Mat> vv(C);
   if (p_.threads > 1) {
     std::vector<std::future<void>> fut;
     for (int ci = 0; ci < C; ci++)
-      fut.push_back(std::async(std::launch::async, [&, ci] { per[ci] = match_camera(ci, grays[ci], r.T_pred, lm, t_orb[ci], nq[ci]); }));
+      fut.push_back(std::async(std::launch::async, [&, ci] { per[ci] = match_camera(ci, grays[ci], r.T_pred, lm, !r.search, t_orb[ci], nq[ci], p_.debug ? &vv[ci] : nullptr); }));
     for (auto &f : fut)
       f.get();
   } else {
     for (int ci = 0; ci < C; ci++)
-      per[ci] = match_camera(ci, grays[ci], r.T_pred, lm, t_orb[ci], nq[ci]);
+      per[ci] = match_camera(ci, grays[ci], r.T_pred, lm, !r.search, t_orb[ci], nq[ci], p_.debug ? &vv[ci] : nullptr);
   }
   std::vector<Obs> obs;
   for (int ci = 0; ci < C; ci++) {
@@ -210,6 +231,10 @@ LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Ma
   const double t2 = now_s();
   r.t_match = std::max(0.0, (t2 - t1) - (p_.threads > 1 ? 0.0 : r.t_orb));
   r.n_corr = (int)obs.size();
+  if (p_.debug) {
+    r.views = vv;
+    r.obs = obs;
+  }
   if (r.n_corr < p_.min_inliers) {
     r.t_total = now_s() - t0;
     return miss(r, "too few matches");
@@ -229,7 +254,9 @@ LocResult Localizer::localize(const std::vector<cv::Mat> &grays, const Eigen::Ma
     return miss(r, "RANSAC failed");
   r.inliers = pr.inliers;
   r.T_meas = pr.T_map_imu;
-  if (r.inliers < p_.min_inliers)
+  if (p_.debug)
+    r.inlier = pr.inlier;
+  if (r.inliers < (r.search ? std::max(p_.min_inliers, p_.search_min_inliers) : p_.min_inliers))
     return miss(r, "too few inliers");
   r.tilt_deg = tilt_deg(r.T_meas.block<3, 3>(0, 0), R_pred);
   if (r.tilt_deg > p_.max_tilt_deg)

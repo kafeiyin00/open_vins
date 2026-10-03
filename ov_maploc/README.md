@@ -10,13 +10,29 @@ C++ only (OpenCV + Eigen, no pycolmap), for deployment on an RK3588.
 
 ## Pipeline
 
-**Map (offline, on the host; not in this package).** The map builder lives in
-the NV_SIM repository (`scripts/40_maploc_poses.sh`, `scripts/41_maploc_build_map.py`):
-OpenVINS poses of a mapping flight → keyframes → each fisheye resampled into a
-120° virtual pinhole view (COLMAP's fisheye models return NaN past 90°) → ORB
-→ pairs chosen from the VIO poses → COLMAP rig triangulation and bundle
-adjustment with weak VIO position priors → `map.npz`, converted here with
-`scripts/map_npz_to_bin.py` to `map.bin`.
+**Map (offline, on the host).** Two builders:
+
+- `maploc_build` (this package, C++, needs Ceres): keyframes of a mapping run
+  (VIO pose + one image per camera, `index.txt`) → each fisheye rendered into
+  the 120° virtual pinhole view with the localizer's own `VirtualView` and ORB
+  → image pairs chosen from the VIO poses (close camera centres and optical
+  axes, any time apart: revisits are loop closures) → Hamming + ratio + mutual
+  matching verified by an essential-matrix RANSAC → union-find tracks,
+  multi-view triangulation → Ceres bundle adjustment (consecutive keyframes
+  held to the VIO's relative motion, every keyframe to the VIO's tilt, the
+  first one fixed) → `map.bin` version 2, `report.json`, `preview.json`, and a
+  self test (the Localizer against the new map on the run's own keyframes).
+  The RK3588_SLAM dev PC runs it from its calibration page on an uploaded bag
+  (`ros/pc/web`: open_vins on the bag, keyframes, then this).
+- NV_SIM (`scripts/40_maploc_poses.sh`, `scripts/41_maploc_build_map.py`):
+  the same steps with COLMAP rig triangulation and bundle adjustment with
+  weak VIO position priors → `map.npz`, converted here with
+  `scripts/map_npz_to_bin.py` to `map.bin` version 1 (ideal r = f θ
+  fisheyes only).
+
+Camera model: OpenVINS' equidistant fisheye (Kannala-Brandt, Kalibr's
+pinhole-equi: fx fy cx cy k1–k4), which the map stores per camera (version
+2; version 1 maps load as k = 0, fx = fy).
 
 **Relocalization (online, `Localizer`, ~1 Hz).**
 1. predict the IMU pose in the map: `T_map_imu = T_map_odom · T_odom_imu`;
@@ -31,18 +47,40 @@ adjustment with weak VIO position priors → `map.npz`, converted here with
    a correction jump ≤ 1.5 m / 10°; the fix is blended into `T_map_odom`
    (first fix replaces it).
 
+Before the first fix the start pose is not trusted (the rig may not stand
+where it was told to): no orientation gate (the pose solver needs only the
+VIO's gravity), and from the third miss on the whole map is walked, `kf_max`
+consecutive keyframes per attempt; such a fix needs ≥ 40 inliers
+(`search_global`, `search_min_inliers`). The tilt gate compares the gravity
+direction in the IMU frame, which the yaw does not change.
+
 Known start: by default the drone starts where the mapping flight started,
 `T_map_odom = start_T_map_imu · inv(first VIO pose)`; or give `start:=x,y,yaw_deg`.
 
 ## Build and run
 
+ROS 1 (`src/ros1_node.cpp`) or ROS 2 (`src/ros_node.cpp`), picked by the build
+like the other OpenVINS packages; the two nodes have the same topics and
+parameters (ROS 1: private `~` parameters).
+
 ```bash
-colcon build --packages-select ov_maploc
 python3 ov_maploc/scripts/map_npz_to_bin.py map.npz map.bin
 
+# ROS 1 (catkin_make / catkin build)
+roslaunch ov_maploc maploc.launch map:=/abs/map.bin \
+    calib:=/abs/kalibr_imucam_chain.yaml masks:=/abs/masks [transport:=compressed]
+
+# ROS 2
+colcon build --packages-select ov_maploc
 ros2 run ov_maploc maploc_node --ros-args -p map:=/abs/map.bin \
     -p calib:=/abs/kalibr_imucam_chain.yaml -p masks:=/abs/masks
 ```
+
+ROS 1 only: `transport:=compressed` subscribes to `<topic>/compressed`
+(`sensor_msgs/CompressedImage`) and decodes just the frames it relocalizes
+(~1 Hz) instead of taking every raw frame of every camera; and a frame's
+cameras are joined within 1 ms rather than by exact stamp (on the RK3588_SLAM
+board one trigger's stamps differ by up to ~1 us between cameras).
 
 | topic / frame | |
 |---|---|

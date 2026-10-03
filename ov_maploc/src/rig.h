@@ -6,27 +6,37 @@
 #define OV_MAPLOC_RIG_H
 
 #include <Eigen/Dense>
+#include <array>
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
 
 namespace ov_maploc {
 
-/// One equidistant fisheye (r = f * theta, OpenCV pixel convention as in OpenVINS).
+/// One fisheye in OpenVINS' equidistant model (Kannala-Brandt, Kalibr's
+/// pinhole-equi), OpenCV pixel convention: theta = angle off the optical axis,
+/// theta_d = theta (1 + k1 theta^2 + k2 theta^4 + k3 theta^6 + k4 theta^8),
+/// u = cx + fx theta_d x / r, v = cy + fy theta_d y / r. k = 0, fx = fy is the
+/// ideal r = f theta of the simulated rigs.
 struct FisheyeCam {
   std::string name, topic;
-  double f = 0, cx = 0, cy = 0;
+  double fx = 0, fy = 0, cx = 0, cy = 0;
+  std::array<double, 4> k{{0, 0, 0, 0}};
   int width = 0, height = 0;
   Eigen::Matrix4d T_imu_cam = Eigen::Matrix4d::Identity(); ///< optical frame in the IMU frame
   cv::Mat mask;                                             ///< uint8, 255 = do not use (OpenVINS convention)
+
+  /// fx fy cx cy k1 k2 k3 k4 width height: what a map stores and is checked against
+  std::array<double, 10> model() const { return {fx, fy, cx, cy, k[0], k[1], k[2], k[3], (double)width, (double)height}; }
 };
 
-/// Reads the same kalibr imu-camera chain OpenVINS reads (pure equidistant
-/// fisheyes only) and <mask_dir>/camN.png when mask_dir is not empty.
+/// Reads the same kalibr imu-camera chain OpenVINS reads (equidistant fisheyes)
+/// and, when mask_dir is not empty, each camera's mask: <mask_dir>/camN.png, or
+/// the OpenVINS config's own mask_<label>.png (label from the topic, /cn2/... -> cn2).
 std::vector<FisheyeCam> load_ring(const std::string &kalibr_yaml, const std::string &mask_dir);
 
-/// Pinhole view rendered from one fisheye with the same optical axis.
-/// Must match maploc/rig.py VirtualView of the map builder exactly.
+/// Pinhole view rendered from one fisheye with the same optical axis. The map
+/// builder (maploc_build) and the localizer both render with this class.
 class VirtualView {
 public:
   VirtualView(const FisheyeCam &cam, int size, double fov_deg);

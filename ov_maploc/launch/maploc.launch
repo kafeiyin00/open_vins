@@ -1,0 +1,35 @@
+<!-- ov_maploc (ROS 1): relocalization against a prebuilt map next to a running
+     OpenVINS. calib is the kalibr_imucam_chain.yaml OpenVINS reads; masks a
+     directory with camN.png. Every other ~parameter keeps its default
+     (README.md); add <param> lines here or pass them with rosparam.
+
+     roslaunch ov_maploc maploc.launch map:=/abs/map.bin calib:=/abs/kalibr_imucam_chain.yaml masks:=/abs/masks -->
+<launch>
+  <arg name="map"/>
+  <arg name="calib"/>
+  <arg name="masks" default=""/>
+  <!-- "x,y,yaw_deg" or "x,y,z,yaw_deg" of the first VIO pose in the map; empty: the mapping flight's start -->
+  <arg name="start" default=""/>
+  <!-- raw: sensor_msgs/Image on the calib topics; compressed: <topic>/compressed, decoded only for the
+       frames relocalized (~1 Hz instead of every frame of every camera) -->
+  <arg name="transport" default="raw"/>
+  <arg name="pose_topic" default="/ov_msckf/poseimu"/>
+  <arg name="reloc_hz" default="1.0"/>
+  <arg name="threads" default="1"/>
+  <!-- false next to a running SLAM: relocalization failing must not take open_vins down -->
+  <arg name="required" default="true"/>
+  <!-- true: /maploc/debug + /maploc/debug_image every attempt (slam-web's match display) -->
+  <arg name="debug" default="false"/>
+
+  <node name="maploc" pkg="ov_maploc" type="maploc_node" output="screen" required="$(arg required)">
+    <param name="map" type="str" value="$(arg map)"/>
+    <param name="calib" type="str" value="$(arg calib)"/>
+    <param name="masks" type="str" value="$(arg masks)"/>
+    <param name="start" type="str" value="$(arg start)"/>
+    <param name="transport" type="str" value="$(arg transport)"/>
+    <param name="pose_topic" type="str" value="$(arg pose_topic)"/>
+    <param name="reloc_hz" type="double" value="$(arg reloc_hz)"/>
+    <param name="threads" type="int" value="$(arg threads)"/>
+    <param name="debug" type="bool" value="$(arg debug)"/>
+  </node>
+</launch>
