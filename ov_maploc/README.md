@@ -15,8 +15,16 @@ C++ only (OpenCV + Eigen, no pycolmap), for deployment on an RK3588.
 - `maploc_build` (this package, C++, needs Ceres): keyframes of a mapping run
   (VIO pose + one image per camera, `index.txt`) → each fisheye rendered into
   the 120° virtual pinhole view with the localizer's own `VirtualView` and ORB
-  → image pairs chosen from the VIO poses (close camera centres and optical
-  axes, any time apart: revisits are loop closures) → Hamming + ratio + mutual
+  → loop closure (`--loop 1`, `src/loop_closure.cpp`): a flat bag of words
+  (1000 words, k-majority on the run's own ORB, TF-IDF, DBoW's L1 score)
+  proposes older keyframes (≥ 20 s) that look alike; each candidate is
+  verified by the generalized PnP of the keyframe's four views against the
+  landmarks triangulated around the older one (≥ 40 inliers, tilt within
+  3°, a plausible correction); a 4-DoF pose graph (x, y, z, yaw, VINS-Mono
+  style) of the VIO's relative motion and the loops corrects the drift, the
+  loop it agrees with least dropped until the rest fit (0.3 m / 3°)
+  → image pairs chosen from the corrected poses (close camera centres and
+  optical axes, any time apart: revisits) → Hamming + ratio + mutual
   matching verified by an essential-matrix RANSAC → union-find tracks,
   multi-view triangulation → Ceres bundle adjustment (consecutive keyframes
   held to the VIO's relative motion, every keyframe to the VIO's tilt, the

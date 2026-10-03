@@ -12,7 +12,8 @@
  *
  * preview.json, for a COLMAP-like view of the result: landmarks [x, y, z, grey] (grey = the
  * views' pixel at the landmark, averaged), keyframes [x, y, z, qw, qx, qy, qz] after the
- * bundle adjustment, vio [x, y, z, yaw] before it, start, the rig (each camera's T_imu_cam),
+ * bundle adjustment, vio [x, y, z, yaw] before it, loops [i, j, inliers, used] (keyframe i
+ * recognized keyframe j), start, the rig (each camera's T_imu_cam),
  * each keyframe's image files and the landmarks it sees.
  *
  * DIR/index.txt:   start tx ty tz qx qy qz qw                 first VIO pose of the run
@@ -20,12 +21,17 @@
  * Poses as OpenVINS publishes /ov_msckf/poseimu (the IMU in its global frame, the quaternion read as Hamilton).
  *
  * 1. per keyframe and camera: virtual pinhole view, ORB
- * 2. image pairs from the VIO poses: camera centres within --pair-radius, optical axes within
+ * 2. loop closure (--loop 1): tracks of nearby keyframes (within 20 s) triangulated from the VIO;
+ *    a bag of words trained on the run's own ORB finds older keyframes (--loop-min-dt) that look
+ *    alike, each verified by a generalized PnP of the keyframe's views against the landmarks
+ *    around the older one; a 4-DoF pose graph (x, y, z, yaw) of the VIO's relative motion and the
+ *    verified loops corrects the drift, loops it cannot agree with dropped; then image pairs from
+ *    the (corrected) poses: camera centres within --pair-radius, optical axes within
  *    --pair-axis-deg, the --pairs-per-image nearest of each image, whatever the time between
- *    them (a revisit is a loop closure)
+ *    them (a revisit)
  * 3. matching: Hamming, ratio test, mutual best; verified by an essential matrix RANSAC on
  *    the pair alone (robust to VIO drift)
- * 4. tracks (union-find), multi-view triangulation from the VIO poses
+ * 4. tracks (union-find), multi-view triangulation from the (corrected) poses
  * 5. bundle adjustment (Ceres): keyframe poses and landmarks; consecutive keyframes held to
  *    the VIO's relative motion (scale), every keyframe to the VIO's tilt (gravity), the first
  *    one fixed (the map frame is the mapping run's VIO frame); two rounds, outliers dropped
@@ -37,6 +43,7 @@
  */
 #include "geometry.h"
 #include "localizer.h"
+#include "loop_closure.h"
 #include "map.h"
 #include "orb_extractor.h"
 #include "rig.h"
@@ -101,6 +108,13 @@ struct Params {
   int threads = 0;
   int selftest = 100; ///< keyframes tried by the self test (0: off)
   int thumb_size = 256; ///< keyframe view thumbnails in the map, px (0: none)
+  int loop = 1;               ///< loop closure before the map is built (0: the VIO poses as they are)
+  int vocab_k = 1000;         ///< words of the run's own vocabulary
+  double loop_min_dt = 20;    ///< s: a loop candidate is at least this much older
+  double loop_min_score = 0.3; ///< BoW score, relative to the previous keyframe's
+  int loop_min_inliers = 40;  ///< generalized PnP inliers
+  double loop_local_dt = 20;  ///< s: the landmarks a loop is verified against come from keyframes this close in time
+  double loop_max_drift = 0.1; ///< a loop may correct the VIO by 1 m + this fraction of the path between the two keyframes
 };
 
 struct Keyframe {
@@ -286,10 +300,13 @@ int main(int argc, char **argv) {
   for (int i = 1; i + 1 < argc; i += 2)
     a.v[argv[i]] = argv[i + 1];
   const std::string dir = a.get("--keyframes"), calib = a.get("--calib"), masks = a.get("--masks"), out = a.get("--out");
-  if (dir.empty() || calib.empty() || out.empty()) {
+  if (dir.empty() || calib.empty() || (out.empty() && a.get("--dump-views").empty())) {
     std::cerr << "usage: maploc_build --keyframes DIR --calib kalibr_imucam_chain.yaml [--masks DIR] --out map.bin\n"
                  "       [--report report.json] [--preview preview.json] [--threads N] [--view-size 512] [--view-fov 120]\n"
-                 "       [--orb-n 2000] [--pair-radius 5] [--pair-axis-deg 60] [--pairs-per-image 12] [--selftest 100]\n";
+                 "       [--orb-n 2000] [--pair-radius 5] [--pair-axis-deg 60] [--pairs-per-image 12] [--selftest 100]\n"
+                 "       [--loop 1] [--vocab-k 1000] [--loop-min-dt 20] [--loop-min-score 0.3] [--loop-min-inliers 40]\n"
+                 "       [--loop-obs loops.txt (ros/pc/loopnet; missing: the bag of words)]\n"
+                 "   or: maploc_build --keyframes DIR --calib ... [--masks DIR] --dump-views DIR (the views for loopnet)\n";
     return 2;
   }
   Params P;
@@ -306,6 +323,11 @@ int main(int argc, char **argv) {
   P.selftest = (int)a.num("--selftest", P.selftest);
   P.thumb_size = (int)a.num("--thumb-size", P.thumb_size);
   P.threads = (int)a.num("--threads", 0);
+  P.loop = (int)a.num("--loop", P.loop);
+  P.vocab_k = (int)a.num("--vocab-k", P.vocab_k);
+  P.loop_min_dt = a.num("--loop-min-dt", P.loop_min_dt);
+  P.loop_min_score = a.num("--loop-min-score", P.loop_min_score);
+  P.loop_min_inliers = (int)a.num("--loop-min-inliers", P.loop_min_inliers);
   if (P.threads <= 0)
     P.threads = (int)std::max(1u, std::thread::hardware_concurrency());
   const double t_start = now_s();
@@ -367,6 +389,9 @@ int main(int argc, char **argv) {
     // ---------------------------------------------------------------- 1. features
     double t0 = now_s();
     const int I = K * C;
+    // --dump-views DIR: the views as rendered here (kfNNNNN_cC.png), their masks and meta.json (view
+    // intrinsics, rig, VIO poses) for ros/pc/loopnet, then stop
+    const std::string dump = a.get("--dump-views");
     std::vector<Image> imgs(I);
     std::atomic<int> bad_imgs{0};
     {
@@ -381,6 +406,14 @@ int main(int argc, char **argv) {
         } else {
           OrbExtractor orb(spec);
           const cv::Mat v = views[im.cam].render(g);
+          if (!dump.empty()) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "/kf%05d_c%d.png", im.kf, im.cam);
+            if (!cv::imwrite(dump + name, v))
+              bad_imgs++;
+            cnt.tick();
+            return;
+          }
           orb.extract(v, views[im.cam].mask, im.kps, im.desc);
           for (const auto &k : im.kps)
             im.grey.push_back(v.at<uint8_t>(std::min(v.rows - 1, std::max(0, (int)std::lround(k.pt.y))),
@@ -397,57 +430,83 @@ int main(int argc, char **argv) {
     if (bad_imgs > 0)
       throw std::runtime_error(std::to_string(bad_imgs.load()) + " keyframe images missing or not " + std::to_string(cams[0].width) + "x" +
                                std::to_string(cams[0].height));
+    if (!dump.empty()) {
+      std::ofstream f(dump + "/meta.json");
+      f << "{\"view_size\": " << P.view_size << ", \"f\": " << jnum(vf, 6) << ", \"c\": " << jnum(vc, 3)
+        << ", \"files\": \"kf%05d_c%d.png\", \"masks\": \"mask_c%d.png\",\n \"cams\": [";
+      for (int c = 0; c < C; c++) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "/mask_c%d.png", c);
+        cv::imwrite(dump + name, views[c].mask);
+        f << (c ? ", " : "") << "{\"name\": \"" << cams[c].name << "\", \"T_imu_cam\": [";
+        for (int r = 0; r < 4; r++)
+          f << (r ? ", " : "") << "[" << jnum(cams[c].T_imu_cam(r, 0), 9) << ", " << jnum(cams[c].T_imu_cam(r, 1), 9) << ", "
+            << jnum(cams[c].T_imu_cam(r, 2), 9) << ", " << jnum(cams[c].T_imu_cam(r, 3), 9) << "]";
+        f << "]}";
+      }
+      f << "],\n \"keyframes\": [";
+      for (int k = 0; k < K; k++) {
+        f << (k ? ",\n  " : "") << "{\"stamp\": " << jnum(kfs[k].stamp, 6) << ", \"T\": [";
+        for (int r = 0; r < 4; r++)
+          f << (r ? ", " : "") << "[" << jnum(kfs[k].T_vio(r, 0), 9) << ", " << jnum(kfs[k].T_vio(r, 1), 9) << ", "
+            << jnum(kfs[k].T_vio(r, 2), 9) << ", " << jnum(kfs[k].T_vio(r, 3), 9) << "]";
+        f << "]}";
+      }
+      f << "]}\n";
+      std::printf("views: %d of %d x %d px -> %s, %.1f s\n", I, P.view_size, P.view_size, dump.c_str(), now_s() - t0);
+      return 0;
+    }
     std::vector<int> base(I + 1, 0); // global keypoint id = base[image] + kp
     for (int i = 0; i < I; i++)
       base[i + 1] = base[i] + (int)imgs[i].kps.size();
     timing["features"] = now_s() - t0;
     std::printf("features: %d keypoints, %.0f per view, %.1f s\n", base[I], double(base[I]) / I, timing["features"]);
 
-    // camera poses from the VIO
+    // camera poses: the VIO's, until the loop closure corrects them
     auto T_map_cam = [&](const std::vector<Eigen::Matrix4d> &T_kf, int i) { return T_kf[imgs[i].kf] * cams[imgs[i].cam].T_imu_cam; };
-    std::vector<Eigen::Matrix4d> T_kf(K);
+    std::vector<Eigen::Matrix4d> T_vio(K), T_kf(K);
     for (int k = 0; k < K; k++)
-      T_kf[k] = kfs[k].T_vio;
+      T_vio[k] = T_kf[k] = kfs[k].T_vio;
 
-    // ---------------------------------------------------------------- 2. pairs
-    t0 = now_s();
-    std::vector<Eigen::Vector3d> centre(I), axis(I);
-    for (int i = 0; i < I; i++) {
-      const Eigen::Matrix4d T = T_map_cam(T_kf, i);
-      centre[i] = T.block<3, 1>(0, 3);
-      axis[i] = T.block<3, 1>(0, 2);
-    }
-    const double cos_axis = std::cos(P.pair_axis_deg * M_PI / 180.0);
-    std::set<std::pair<int, int>> pairset;
-    for (int i = 0; i < I; i++) {
-      std::vector<std::pair<double, int>> cand;
-      for (int j = 0; j < I; j++) {
-        if (imgs[j].kf == imgs[i].kf)
-          continue;
-        const double d = (centre[i] - centre[j]).norm();
-        const double ca = axis[i].dot(axis[j]);
-        if (d <= P.pair_radius && ca >= cos_axis)
-          cand.emplace_back(d + 0.02 * std::acos(std::min(1.0, ca)) * 180.0 / M_PI, j);
+    // ---------------------------------------------------------------- 2. pairs (of the given poses, within max_dt s)
+    auto select_pairs = [&](const std::vector<Eigen::Matrix4d> &Tk, double max_dt) {
+      std::vector<Eigen::Vector3d> centre(I), axis(I);
+      for (int i = 0; i < I; i++) {
+        const Eigen::Matrix4d T = T_map_cam(Tk, i);
+        centre[i] = T.block<3, 1>(0, 3);
+        axis[i] = T.block<3, 1>(0, 2);
       }
-      const size_t n = std::min(cand.size(), (size_t)P.pairs_per_image);
-      std::partial_sort(cand.begin(), cand.begin() + n, cand.end());
-      for (size_t k = 0; k < n; k++)
-        pairset.insert({std::min(i, cand[k].second), std::max(i, cand[k].second)});
-    }
-    const std::vector<std::pair<int, int>> pairs(pairset.begin(), pairset.end());
-    timing["pairs"] = now_s() - t0;
-    std::printf("pairs: %zu candidate image pairs\n", pairs.size());
+      const double cos_axis = std::cos(P.pair_axis_deg * M_PI / 180.0);
+      std::set<std::pair<int, int>> pairset;
+      for (int i = 0; i < I; i++) {
+        std::vector<std::pair<double, int>> cand;
+        for (int j = 0; j < I; j++) {
+          if (imgs[j].kf == imgs[i].kf || std::abs(kfs[imgs[j].kf].stamp - kfs[imgs[i].kf].stamp) > max_dt)
+            continue;
+          const double d = (centre[i] - centre[j]).norm();
+          const double ca = axis[i].dot(axis[j]);
+          if (d <= P.pair_radius && ca >= cos_axis)
+            cand.emplace_back(d + 0.02 * std::acos(std::min(1.0, ca)) * 180.0 / M_PI, j);
+        }
+        const size_t n = std::min(cand.size(), (size_t)P.pairs_per_image);
+        std::partial_sort(cand.begin(), cand.begin() + n, cand.end());
+        for (size_t k = 0; k < n; k++)
+          pairset.insert({std::min(i, cand[k].second), std::max(i, cand[k].second)});
+      }
+      return std::vector<std::pair<int, int>>(pairset.begin(), pairset.end());
+    };
 
-    // ---------------------------------------------------------------- 3. matching
-    t0 = now_s();
-    std::vector<Match> matches(pairs.size());
-    {
-      Counter cnt("matching", (int)pairs.size());
-      parallel_for((int)pairs.size(), P.threads, [&](int pi) {
-        Match &m = matches[pi];
-        m.a = pairs[pi].first;
-        m.b = pairs[pi].second;
-        const Image &A = imgs[m.a], &B = imgs[m.b];
+    // ---------------------------------------------------------------- 3. matching (each pair once)
+    std::map<std::pair<int, int>, std::vector<std::pair<int, int>>> match_cache;
+    auto match_all = [&](const std::vector<std::pair<int, int>> &pairs, const char *stage) {
+      std::vector<std::pair<int, int>> todo;
+      for (const auto &pr : pairs)
+        if (!match_cache.count(pr))
+          todo.push_back(pr);
+      std::vector<std::vector<std::pair<int, int>>> res(todo.size());
+      Counter cnt(stage, (int)todo.size());
+      parallel_for((int)todo.size(), P.threads, [&](int pi) {
+        const Image &A = imgs[todo[pi].first], &B = imgs[todo[pi].second];
         if (A.kps.size() < 20 || B.kps.size() < 20) {
           cnt.tick();
           return;
@@ -478,55 +537,15 @@ int main(int argc, char **argv) {
           if (!E.empty() && cv::countNonZero(mask) >= P.min_pair_inliers)
             for (size_t k = 0; k < put.size(); k++)
               if (mask.at<uint8_t>((int)k))
-                m.kp.push_back(put[k]);
+                res[pi].push_back(put[k]);
         }
         cnt.tick();
       });
-    }
-    int pairs_ok = 0, loop_pairs = 0;
-    size_t n_match = 0;
-    for (const auto &m : matches)
-      if (!m.kp.empty()) {
-        pairs_ok++;
-        n_match += m.kp.size();
-        if (std::abs(kfs[imgs[m.a].kf].stamp - kfs[imgs[m.b].kf].stamp) > 30.0)
-          loop_pairs++;
-      }
-    timing["matching"] = now_s() - t0;
-    std::printf("matching: %d of %zu pairs verified (%d more than 30 s apart: revisits), %zu matches, %.1f s\n", pairs_ok, pairs.size(),
-                loop_pairs, n_match, timing["matching"]);
+      for (size_t k = 0; k < todo.size(); k++)
+        match_cache[todo[k]] = std::move(res[k]);
+    };
 
     // ---------------------------------------------------------------- 4. tracks + triangulation
-    t0 = now_s();
-    DSU dsu(base[I]);
-    for (const auto &m : matches)
-      for (const auto &kv : m.kp)
-        dsu.unite(base[m.a] + kv.first, base[m.b] + kv.second);
-    std::unordered_map<int, std::vector<std::pair<int, int>>> groups;
-    for (const auto &m : matches)
-      for (const auto &kv : m.kp)
-        for (const auto &ik : {std::make_pair(m.a, kv.first), std::make_pair(m.b, kv.second)}) {
-          auto &g = groups[dsu.find(base[ik.first] + ik.second)];
-          g.push_back(ik);
-        }
-    std::vector<Track> tracks;
-    int conflicts = 0;
-    for (auto &kv : groups) {
-      auto &o = kv.second;
-      std::sort(o.begin(), o.end());
-      o.erase(std::unique(o.begin(), o.end()), o.end());
-      bool bad = false;
-      for (size_t k = 1; k < o.size(); k++)
-        bad = bad || o[k].first == o[k - 1].first; // two keypoints of one image
-      if (bad) {
-        conflicts++;
-        continue;
-      }
-      if (o.size() >= 2)
-        tracks.push_back({o, Eigen::Vector3d::Zero()});
-    }
-    groups.clear();
-
     // ray of an observation in the map frame, and the reprojection error in the view, px
     auto ray = [&](const std::vector<Eigen::Matrix4d> &Tk, int i, int kp, Eigen::Vector3d &c, Eigen::Vector3d &d) {
       const Eigen::Matrix4d T = T_map_cam(Tk, i);
@@ -579,17 +598,348 @@ int main(int argc, char **argv) {
       }
       return false;
     };
-    std::vector<uint8_t> keep_t(tracks.size(), 0);
-    parallel_for((int)tracks.size(), P.threads, [&](int ti) { keep_t[ti] = triangulate(T_kf, tracks[ti], 2 * P.max_reproj_px, true); });
-    {
+    // the matches of these pairs -> tracks (union-find) -> triangulated with the poses Tk
+    auto build_tracks = [&](const std::vector<std::pair<int, int>> &pairs, const std::vector<Eigen::Matrix4d> &Tk, const char *what) {
+      DSU dsu(base[I]);
+      for (const auto &pr : pairs)
+        for (const auto &kv : match_cache[pr])
+          dsu.unite(base[pr.first] + kv.first, base[pr.second] + kv.second);
+      std::unordered_map<int, std::vector<std::pair<int, int>>> groups;
+      for (const auto &pr : pairs)
+        for (const auto &kv : match_cache[pr])
+          for (const auto &ik : {std::make_pair(pr.first, kv.first), std::make_pair(pr.second, kv.second)})
+            groups[dsu.find(base[ik.first] + ik.second)].push_back(ik);
+      std::vector<Track> ts;
+      int conflicts = 0;
+      for (auto &kv : groups) {
+        auto &o = kv.second;
+        std::sort(o.begin(), o.end());
+        o.erase(std::unique(o.begin(), o.end()), o.end());
+        bool bad = false;
+        for (size_t k = 1; k < o.size(); k++)
+          bad = bad || o[k].first == o[k - 1].first; // two keypoints of one image
+        if (bad)
+          conflicts++;
+        else if (o.size() >= 2)
+          ts.push_back({o, Eigen::Vector3d::Zero()});
+      }
+      std::vector<uint8_t> keep(ts.size(), 0);
+      parallel_for((int)ts.size(), P.threads, [&](int ti) { keep[ti] = triangulate(Tk, ts[ti], 2 * P.max_reproj_px, true); });
       std::vector<Track> kept;
-      for (size_t ti = 0; ti < tracks.size(); ti++)
-        if (keep_t[ti])
-          kept.push_back(std::move(tracks[ti]));
-      std::printf("tracks: %zu from the matches (%d with conflicting keypoints dropped), %zu triangulated\n", tracks.size(), conflicts,
+      for (size_t ti = 0; ti < ts.size(); ti++)
+        if (keep[ti])
+          kept.push_back(std::move(ts[ti]));
+      std::printf("tracks (%s): %zu from the matches (%d with conflicting keypoints dropped), %zu triangulated\n", what, ts.size(), conflicts,
                   kept.size());
-      tracks.swap(kept);
+      return kept;
+    };
+
+    // ---------------------------------------------------------------- loop closure
+    // Candidates either learned (--loop-obs: ros/pc/loopnet on a GPU host -- MegaLoc retrieval, ALIKED +
+    // LightGlue matches of the keyframe's views to points triangulated around the older keyframe) or from
+    // this run's own bag of words, ORB matched against the landmarks triangulated around the older keyframe.
+    // Each verified by the localizer's generalized PnP; then a 4-DoF pose graph of the VIO's relative motion
+    // and the loops (GNC-TLS: wrong loops weighted out) corrects the keyframe poses everything after this is
+    // built on.
+    struct LoopEdge {
+      int i = 0, j = 0, inliers = 0;
+      double corr_m = 0, corr_deg = 0;
+      PoseEdge e;
+      bool used = false;
+    };
+    std::vector<LoopEdge> loops;
+    int loop_cands = 0, loops_used = 0;
+    double pg_max_move = 0, pg_end_gap_vio = 0, pg_end_gap = 0;
+    std::string loop_method = P.loop ? "none" : "off", loop_note;
+    if (P.loop && K >= 10) {
+      t0 = now_s();
+      std::vector<double> path(K, 0.0);
+      for (int k = 1; k < K; k++)
+        path[k] = path[k - 1] + (T_vio[k].block<3, 1>(0, 3) - T_vio[k - 1].block<3, 1>(0, 3)).norm();
+      RigModel rig;
+      for (const auto &c : cams) {
+        rig.R_imu_cam.push_back(c.T_imu_cam.block<3, 3>(0, 0));
+        rig.p_imu_cam.push_back(c.T_imu_cam.block<3, 1>(0, 3));
+      }
+      rig.f = vf;
+      rig.cx = rig.cy = vc;
+      // keyframe i against its 2D-3D matches to points around keyframe j (the VIO frame there)
+      auto verify = [&](int i, int j, const std::vector<Obs> &obs, LoopEdge &L) {
+        if ((int)obs.size() < P.loop_min_inliers)
+          return false;
+        const Eigen::Matrix3d R_i = T_vio[i].block<3, 3>(0, 0);
+        PoseOptions po;
+        po.max_px = 3.0;
+        const PoseResult pr = solve_generalized_pose(obs, rig, Rz(-yaw_of(R_i)) * R_i, po);
+        if (!pr.ok || pr.inliers < P.loop_min_inliers || tilt_deg(pr.T_map_imu.block<3, 3>(0, 0), R_i) >= 3.0)
+          return false;
+        // i relative to j as the loop sees it, against what the VIO says
+        L.i = i;
+        L.j = j;
+        L.inliers = pr.inliers;
+        L.e = relative_4dof(T_vio[j], pr.T_map_imu, j, i);
+        const PoseEdge v = relative_4dof(T_vio[j], T_vio[i], j, i);
+        L.corr_m = (L.e.t_ab - v.t_ab).norm();
+        L.corr_deg = std::abs(wrap_rad(L.e.dyaw - v.dyaw)) * 180 / M_PI;
+        // a plausible drift: within loop_max_drift of the path between them, plus a metre
+        if (L.corr_m > 1.0 + P.loop_max_drift * (path[i] - path[j]) || L.corr_deg > 30.0)
+          return false;
+        L.e.loop = true;
+        L.e.sigma_t = 0.05;
+        L.e.sigma_yaw = 1.0 * M_PI / 180;
+        return true;
+      };
+      std::vector<std::pair<int, int>> cands;
+      std::vector<LoopEdge> found;
+      std::vector<uint8_t> ok;
+
+      // learned candidates: "loopnet 1 METHOD", then per candidate "cand i j similarity n" and n lines "cam u v X Y Z"
+      std::vector<std::vector<Obs>> net_obs;
+      const std::string net_file = a.get("--loop-obs");
+      if (!net_file.empty()) {
+        std::ifstream f(net_file);
+        std::string tag, method;
+        int version = 0;
+        if (!f)
+          loop_note = "no " + net_file;
+        else if (!(f >> tag >> version >> method) || tag != "loopnet" || version != 1)
+          loop_note = net_file + " is not loopnet output (version 1)";
+        else {
+          int i, j, n;
+          double sim;
+          bool bad = false;
+          while (!bad && f >> tag) {
+            if (tag != "cand" || !(f >> i >> j >> sim >> n) || i < 0 || i >= K || j < 0 || j >= K || n < 0) {
+              bad = true;
+              break;
+            }
+            std::vector<Obs> obs(n);
+            for (int k = 0; k < n && !bad; k++) {
+              Obs &o = obs[k];
+              bad = !(f >> o.cam >> o.uv.x() >> o.uv.y() >> o.X.x() >> o.X.y() >> o.X.z()) || o.cam < 0 || o.cam >= C;
+              o.lid = k;
+            }
+            cands.emplace_back(i, j);
+            net_obs.push_back(std::move(obs));
+          }
+          if (bad) {
+            loop_note = net_file + ": unreadable after " + std::to_string(cands.size()) + " candidates";
+            cands.clear();
+            net_obs.clear();
+          } else
+            loop_method = method;
+        }
+      }
+      if (loop_method != "none") {
+        found.resize(cands.size());
+        ok.assign(cands.size(), 0);
+        Counter cnt("loops", (int)cands.size());
+        parallel_for((int)cands.size(), P.threads, [&](int ci) {
+          ok[ci] = verify(cands[ci].first, cands[ci].second, net_obs[ci], found[ci]);
+          cnt.tick();
+        });
+      } else {
+        if (!loop_note.empty())
+          std::printf("loops: %s -- the bag of words instead\n", loop_note.c_str());
+        loop_method = "bow";
+        const auto pairs_local = select_pairs(T_vio, P.loop_local_dt);
+        match_all(pairs_local, "matching");
+        std::vector<Track> local = build_tracks(pairs_local, T_vio, "local");
+        // vocabulary from a sample of every descriptor, words per keyframe (all its cameras)
+        std::vector<Bits256> sample;
+        const int stride = std::max(1, base[I] / 200000);
+        for (int i = 0, n = 0; i < I; i++)
+          for (int r = 0; r < imgs[i].desc.rows; r++, n++)
+            if (n % stride == 0)
+              sample.push_back(bits_of(imgs[i].desc.ptr<uint8_t>(r)));
+        Vocabulary voc;
+        voc.train(sample, P.vocab_k, 6, P.threads);
+        std::vector<std::vector<int>> img_words(I);
+        Counter wcnt("bow", I);
+        parallel_for(I, P.threads, [&](int i) {
+          for (int r = 0; r < imgs[i].desc.rows; r++)
+            img_words[i].push_back(voc.word(bits_of(imgs[i].desc.ptr<uint8_t>(r))));
+          wcnt.tick();
+        });
+        std::vector<std::vector<int>> docs(K);
+        for (int i = 0; i < I; i++)
+          docs[imgs[i].kf].insert(docs[imgs[i].kf].end(), img_words[i].begin(), img_words[i].end());
+        const std::vector<BowVector> bow = bow_vectors(docs, voc.size());
+        // candidates: older keyframes (loop_min_dt before) scoring well against this one, relative to its neighbour
+        for (int i = 1; i < K; i++) {
+          const double ref = bow_score(bow[i], bow[i - 1]);
+          if (ref < 0.01)
+            continue;
+          std::vector<std::pair<double, int>> sc;
+          for (int j = 0; j < K; j++)
+            if (kfs[i].stamp - kfs[j].stamp >= P.loop_min_dt)
+              sc.emplace_back(bow_score(bow[i], bow[j]), j);
+          std::sort(sc.rbegin(), sc.rend());
+          std::vector<int> picked;
+          for (const auto &c : sc) {
+            if ((int)picked.size() >= 3 || c.first < P.loop_min_score * ref)
+              break;
+            bool near = false;
+            for (int q : picked)
+              near = near || std::abs(q - c.second) <= 2;
+            if (!near) {
+              picked.push_back(c.second);
+              cands.emplace_back(i, c.second);
+            }
+          }
+        }
+        // verification against the tracks of the keyframes around j
+        std::vector<std::vector<int>> kf_tracks(K);
+        for (size_t ti = 0; ti < local.size(); ti++)
+          for (const auto &o : local[ti].obs)
+            kf_tracks[imgs[o.first].kf].push_back((int)ti);
+        for (auto &v : kf_tracks) {
+          std::sort(v.begin(), v.end());
+          v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+        found.resize(cands.size());
+        ok.assign(cands.size(), 0);
+        Counter cnt("loops", (int)cands.size());
+        parallel_for((int)cands.size(), P.threads, [&](int ci) {
+          const int i = cands[ci].first, j = cands[ci].second;
+          std::vector<int> lm;
+          for (int k = std::max(0, j - 2); k <= std::min(K - 1, j + 2); k++)
+            lm.insert(lm.end(), kf_tracks[k].begin(), kf_tracks[k].end());
+          std::sort(lm.begin(), lm.end());
+          lm.erase(std::unique(lm.begin(), lm.end()), lm.end());
+          if ((int)lm.size() < P.loop_min_inliers) {
+            cnt.tick();
+            return;
+          }
+          std::vector<int> rows_tid;
+          std::vector<cv::Mat> rows;
+          for (int ti : lm)
+            for (const auto &o : local[ti].obs) {
+              rows.push_back(imgs[o.first].desc.row(o.second));
+              rows_tid.push_back(ti);
+            }
+          cv::Mat dm;
+          cv::vconcat(rows, dm);
+          std::vector<Obs> obs;
+          cv::BFMatcher bf(cv::NORM_HAMMING);
+          for (int c = 0; c < C; c++) {
+            const Image &q = imgs[i * C + c];
+            if (q.desc.empty())
+              continue;
+            std::vector<std::vector<cv::DMatch>> knn;
+            bf.knnMatch(q.desc, dm, knn, std::min(4, dm.rows));
+            std::unordered_map<int, std::pair<int, float>> best; // track -> (keypoint, distance)
+            for (size_t r = 0; r < knn.size(); r++) {
+              if (knn[r].empty())
+                continue;
+              const cv::DMatch &b0 = knn[r][0];
+              const int tid = rows_tid[b0.trainIdx];
+              float second = 256.f;
+              for (size_t k = 1; k < knn[r].size(); k++)
+                if (rows_tid[knn[r][k].trainIdx] != tid) {
+                  second = knn[r][k].distance;
+                  break;
+                }
+              if (b0.distance > P.max_hamming || b0.distance >= P.ratio * second)
+                continue;
+              auto it = best.find(tid);
+              if (it == best.end() || b0.distance < it->second.second)
+                best[tid] = {(int)r, b0.distance};
+            }
+            for (const auto &kv : best) {
+              Obs o;
+              o.cam = c;
+              o.uv = Eigen::Vector2d(q.kps[kv.second.first].pt.x, q.kps[kv.second.first].pt.y);
+              o.X = local[kv.first].X;
+              o.lid = kv.first;
+              obs.push_back(o);
+            }
+          }
+          ok[ci] = verify(i, j, obs, found[ci]);
+          cnt.tick();
+        });
+      }
+      loop_cands = (int)cands.size();
+      for (size_t ci = 0; ci < cands.size(); ci++)
+        if (ok[ci])
+          loops.push_back(found[ci]);
+      // pose graph: the VIO's relative motion between consecutive keyframes + the loops
+      if (!loops.empty()) {
+        std::vector<PoseEdge> odo, le;
+        for (int k = 0; k + 1 < K; k++) {
+          PoseEdge e = relative_4dof(T_vio[k], T_vio[k + 1], k, k + 1);
+          e.sigma_t = P.rel_sigma_t + P.rel_sigma_t_frac * e.t_ab.norm();
+          e.sigma_yaw = P.rel_sigma_r_deg * M_PI / 180;
+          odo.push_back(e);
+        }
+        for (const auto &L : loops)
+          le.push_back(L.e);
+        // GNC-TLS first (a loop beyond 0.3 m at the loops' 5 cm sigma is an outlier) ...
+        T_kf = T_vio;
+        const std::vector<double> w = robust_pose_graph(T_kf, odo, le, P.threads, 0.3 / 0.05);
+        std::vector<int> active;
+        for (size_t l = 0; l < loops.size(); l++)
+          if (w[l] > 0)
+            active.push_back((int)l);
+        // ... then, as a check, the loop the graph agrees with least is dropped, one at a time, until
+        // the rest fit within 0.3 m and 3 deg
+        while (!active.empty()) {
+          std::vector<PoseEdge> edges = odo;
+          for (int l : active)
+            edges.push_back(loops[l].e);
+          T_kf = T_vio;
+          const auto res = optimize_pose_graph(T_kf, edges, P.threads);
+          size_t worst = 0;
+          double worst_r = 0;
+          for (size_t q = 0; q < active.size(); q++) {
+            const auto &r = res[odo.size() + q];
+            const double x = std::max(r.first / 0.3, r.second / (3.0 * M_PI / 180));
+            if (x > worst_r) {
+              worst_r = x;
+              worst = q;
+            }
+          }
+          if (worst_r <= 1.0)
+            break;
+          active.erase(active.begin() + worst);
+        }
+        for (int l : active)
+          loops[l].used = true;
+        if (active.empty())
+          T_kf = T_vio;
+        for (int k = 0; k < K; k++)
+          pg_max_move = std::max(pg_max_move, (T_kf[k].block<3, 1>(0, 3) - T_vio[k].block<3, 1>(0, 3)).norm());
+      }
+      pg_end_gap_vio = (T_vio[K - 1].block<3, 1>(0, 3) - T_vio[0].block<3, 1>(0, 3)).norm();
+      pg_end_gap = (T_kf[K - 1].block<3, 1>(0, 3) - T_kf[0].block<3, 1>(0, 3)).norm();
+      timing["loops"] = now_s() - t0;
+      for (const auto &L : loops)
+        loops_used += L.used;
+      std::printf("loops (%s): %d candidates, %zu verified, %d kept by the pose graph; keyframes moved up to %.3f m; "
+                  "last-first keyframe %.3f m (VIO) -> %.3f m, %.1f s\n",
+                  loop_method.c_str(), loop_cands, loops.size(), loops_used, pg_max_move, pg_end_gap_vio, pg_end_gap, timing["loops"]);
     }
+
+    // ---------------------------------------------------------------- pairs, matches, tracks from the (corrected) poses
+    t0 = now_s();
+    const auto pairs = select_pairs(T_kf, 1e18);
+    match_all(pairs, match_cache.empty() ? "matching" : "revisits");
+    int pairs_ok = 0, loop_pairs = 0;
+    size_t n_match = 0;
+    for (const auto &pr : pairs) {
+      const auto &m = match_cache[pr];
+      if (m.empty())
+        continue;
+      pairs_ok++;
+      n_match += m.size();
+      if (std::abs(kfs[imgs[pr.first].kf].stamp - kfs[imgs[pr.second].kf].stamp) > 30.0)
+        loop_pairs++;
+    }
+    timing["matching"] = now_s() - t0;
+    std::printf("matching: %d of %zu pairs verified (%d more than 30 s apart: revisits), %zu matches, %.1f s\n", pairs_ok, pairs.size(),
+                loop_pairs, n_match, timing["matching"]);
+    t0 = now_s();
+    std::vector<Track> tracks = build_tracks(pairs, T_kf, "all");
     timing["triangulation"] = now_s() - t0;
     if (tracks.size() < 100)
       throw std::runtime_error("only " + std::to_string(tracks.size()) +
@@ -868,6 +1218,10 @@ int main(int argc, char **argv) {
         << " \"reproj_after\": {\"mean\": " << jnum(err1_mean, 3) << ", \"median\": " << jnum(err1_med, 3) << "},\n"
         << " \"ba_moved\": {\"median_m\": " << jnum(median(dpos)) << ", \"max_m\": " << jnum(*std::max_element(dpos.begin(), dpos.end()))
         << ", \"max_yaw_deg\": " << jnum(*std::max_element(dyaw.begin(), dyaw.end()), 3) << "},\n"
+        << " \"loops\": {\"enabled\": " << (P.loop ? "true" : "false") << ", \"method\": \"" << loop_method << "\", \"note\": \""
+        << loop_note << "\", \"candidates\": " << loop_cands
+        << ", \"verified\": " << loops.size() << ", \"used\": " << loops_used << ", \"max_correction_m\": " << jnum(pg_max_move)
+        << ", \"end_gap_vio_m\": " << jnum(pg_end_gap_vio) << ", \"end_gap_m\": " << jnum(pg_end_gap) << "},\n"
         << " \"ba\": [";
       for (size_t i = 0; i < ba_log.size(); i++)
         f << (i ? ", " : "") << "\"" << ba_log[i] << "\"";
@@ -908,6 +1262,9 @@ int main(int argc, char **argv) {
         f << (k ? "," : "") << "[" << jnum(T(0, 3), 3) << "," << jnum(T(1, 3), 3) << "," << jnum(T(2, 3), 3) << ","
           << jnum(yaw_of(T.block<3, 3>(0, 0)), 4) << "]";
       }
+      f << "], \"loops\": [";
+      for (size_t l = 0; l < loops.size(); l++)
+        f << (l ? "," : "") << "[" << loops[l].i << "," << loops[l].j << "," << loops[l].inliers << "," << (int)loops[l].used << "]";
       const Eigen::Matrix4d &S = m.start_T_map_imu;
       f << "], \"start\": [" << jnum(S(0, 3), 3) << "," << jnum(S(1, 3), 3) << "," << jnum(S(2, 3), 3) << ","
         << jnum(yaw_of(S.block<3, 3>(0, 0)), 4) << "], \"cams\": [";

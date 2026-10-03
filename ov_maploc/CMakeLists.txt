@@ -42,7 +42,7 @@ set(MAPLOC_TOOLS maploc_bench)
 # the map builder (no ROS): needs Ceres for the bundle adjustment
 find_package(Ceres QUIET)
 if (Ceres_FOUND)
-    add_executable(maploc_build src/build_map.cpp)
+    add_executable(maploc_build src/build_map.cpp src/loop_closure.cpp)
     target_include_directories(maploc_build PRIVATE ${CERES_INCLUDE_DIRS})
     target_link_libraries(maploc_build ov_maploc_core ${CERES_LIBRARIES} ${OpenCV_LIBS})
     list(APPEND MAPLOC_TOOLS maploc_build)
