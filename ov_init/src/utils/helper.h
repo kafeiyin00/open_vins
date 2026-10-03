@@ -141,20 +141,19 @@ public:
     // We need to ensure we normalize after each one such that we obtain unit vectors
     Eigen::Vector3d z_axis = gravity_inI / gravity_inI.norm();
     Eigen::Vector3d x_axis, y_axis;
-    Eigen::Vector3d e_1(1.0, 0.0, 0.0);
-    Eigen::Vector3d e_2(0.0, 1.0, 0.0);
-    double inner1 = e_1.dot(z_axis) / z_axis.norm();
-    double inner2 = e_2.dot(z_axis) / z_axis.norm();
-    if (fabs(inner1) < fabs(inner2)) {
-      x_axis = z_axis.cross(e_1);
+    // Global x = the IMU x axis laid flat, so every start is at yaw 0 in the IMU's own heading. (The cross product
+    // with e1 or e2 used before started at 180 or -90 deg, picked by the sign of a small tilt.) With the IMU x axis
+    // (nearly) vertical, lay its y axis flat as global y instead.
+    x_axis = Eigen::Vector3d::UnitX() - z_axis * z_axis(0);
+    if (x_axis.norm() > 0.1) {
       x_axis = x_axis / x_axis.norm();
       y_axis = z_axis.cross(x_axis);
       y_axis = y_axis / y_axis.norm();
     } else {
-      x_axis = z_axis.cross(e_2);
-      x_axis = x_axis / x_axis.norm();
-      y_axis = z_axis.cross(x_axis);
+      y_axis = Eigen::Vector3d::UnitY() - z_axis * z_axis(1);
       y_axis = y_axis / y_axis.norm();
+      x_axis = y_axis.cross(z_axis);
+      x_axis = x_axis / x_axis.norm();
     }
 
     // Original method
