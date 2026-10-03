@@ -29,7 +29,10 @@
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/Imu.h>
 
+#include <atomic>
 #include <memory>
+#include <set>
+#include <thread>
 
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h"
@@ -38,14 +41,9 @@
 
 using namespace ov_msckf;
 
-// A camera message of the bag as a mono8 image: raw, or compressed (JPEG, or PNG of 8 or 16 bits -- the
-// RK3588_SLAM board records its cameras compressed) and decoded here. nullptr if it is neither.
-static sensor_msgs::ImageConstPtr to_image(const rosbag::MessageInstance &m) {
-  if (sensor_msgs::ImageConstPtr img = m.instantiate<sensor_msgs::Image>())
-    return img;
-  sensor_msgs::CompressedImage::ConstPtr c = m.instantiate<sensor_msgs::CompressedImage>();
-  if (!c)
-    return nullptr;
+// A compressed camera image (JPEG, or PNG of 8 or 16 bits -- the RK3588_SLAM board records its cameras
+// compressed) as mono8. nullptr if it does not decode.
+static sensor_msgs::ImageConstPtr decode(const sensor_msgs::CompressedImage::ConstPtr &c) {
   cv::Mat im = cv::imdecode(c->data, cv::IMREAD_UNCHANGED);
   if (im.empty())
     return nullptr;
@@ -55,6 +53,66 @@ static sensor_msgs::ImageConstPtr to_image(const rosbag::MessageInstance &m) {
     im.convertTo(im, CV_8U, 1.0 / 256);
   return cv_bridge::CvImage(c->header, "mono8", im).toImageMsg();
 }
+
+// A camera message of the bag as a mono8 image: raw, or compressed and decoded. nullptr if it is neither.
+static sensor_msgs::ImageConstPtr to_image(const rosbag::MessageInstance &m) {
+  if (sensor_msgs::ImageConstPtr img = m.instantiate<sensor_msgs::Image>())
+    return img;
+  sensor_msgs::CompressedImage::ConstPtr c = m.instantiate<sensor_msgs::CompressedImage>();
+  return c ? decode(c) : nullptr;
+}
+
+// The camera images of the bag, decoded a block ahead of their use: the bag is read in order on the
+// calling thread (rosbag::Bag is not thread safe), the decoding -- a third of a serial run's time when it
+// was done image by image -- on several threads. get() hands each image out once.
+class ImagePrefetch {
+public:
+  ImagePrefetch(const std::vector<rosbag::MessageInstance> &msgs, const std::vector<std::string> &topics, int threads)
+      : msgs_(msgs), cam_(msgs.size(), false), out_(msgs.size()), threads_(std::max(1, threads)) {
+    const std::set<std::string> t(topics.begin(), topics.end());
+    for (size_t i = 0; i < msgs.size(); i++)
+      cam_[i] = t.count(msgs[i].getTopic()) > 0;
+  }
+  sensor_msgs::ImageConstPtr get(size_t m) {
+    if (m >= next_)
+      fill(m);
+    sensor_msgs::ImageConstPtr r = out_[m];
+    out_[m].reset();
+    return r;
+  }
+
+private:
+  void fill(size_t from) {
+    std::vector<size_t> idx;
+    std::vector<sensor_msgs::CompressedImage::ConstPtr> comp;
+    size_t m = from;
+    for (; m < msgs_.size() && idx.size() < 256; m++) {
+      if (!cam_[m])
+        continue;
+      if (sensor_msgs::ImageConstPtr img = msgs_[m].instantiate<sensor_msgs::Image>()) {
+        out_[m] = img;
+      } else if (sensor_msgs::CompressedImage::ConstPtr c = msgs_[m].instantiate<sensor_msgs::CompressedImage>()) {
+        idx.push_back(m);
+        comp.push_back(c);
+      }
+    }
+    next_ = m;
+    std::atomic<size_t> k{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < threads_; t++)
+      ts.emplace_back([&] {
+        for (size_t i; (i = k++) < idx.size();)
+          out_[idx[i]] = decode(comp[i]);
+      });
+    for (auto &t : ts)
+      t.join();
+  }
+  const std::vector<rosbag::MessageInstance> &msgs_;
+  std::vector<bool> cam_;
+  std::vector<sensor_msgs::ImageConstPtr> out_;
+  int threads_;
+  size_t next_ = 0;
+};
 
 std::shared_ptr<VioManager> sys;
 std::shared_ptr<ROS1Visualizer> viz;
@@ -122,6 +180,9 @@ int main(int argc, char **argv) {
   const bool ring = params.use_stereo && params.state_options.num_cameras > 2;
   if (ring)
     viz->set_drop_stale(false);
+  bool odometry;
+  nh->param<bool>("odometry", odometry, true);
+  viz->set_odometry(odometry);
 
   // A recorder of the poses started next to this node (wait_subscriber_s > 0): wait for it to connect before
   // the first pose; and linger at the end (end_linger_s) so that the last poses reach it.
@@ -225,6 +286,9 @@ int main(int argc, char **argv) {
   //===================================================================================
 
   // Loop through our message array, and lets process them
+  int decode_threads;
+  nh->param<int>("decode_threads", decode_threads, (int)std::min(16u, std::max(1u, std::thread::hardware_concurrency() / 2)));
+  ImagePrefetch prefetch(msgs, topic_cameras, decode_threads);
   std::set<int> used_index;
   for (int m = 0; m < (int)msgs.size(); m++) {
 
@@ -254,7 +318,7 @@ int main(int argc, char **argv) {
         continue;
 
       if (ring) {
-        sensor_msgs::ImageConstPtr img = to_image(msgs.at(m));
+        sensor_msgs::ImageConstPtr img = prefetch.get(m);
         if (img)
           viz->callback_ring(img, cam_id);
         else

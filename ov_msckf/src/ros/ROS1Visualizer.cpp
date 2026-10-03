@@ -258,8 +258,8 @@ void ROS1Visualizer::visualize() {
 
 void ROS1Visualizer::visualize_odometry(double timestamp) {
 
-  // Return if we have not inited
-  if (!_app->initialized())
+  // Return if we have not inited, or nobody wants it (set_odometry)
+  if (!odometry || !_app->initialized())
     return;
 
   // Get fast propagate state at the desired timestamp
@@ -476,7 +476,7 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   thread_update_running = true;
   // By value: the thread is detached and outlives this callback's message.
   const double timestamp_imu = message.timestamp;
-  std::thread thread([this, timestamp_imu] {
+  auto process = [this, timestamp_imu] {
     // Count how many unique image streams
     auto params = _app->get_params();
     bool ring = (params.use_stereo && params.state_options.num_cameras > 2);
@@ -525,14 +525,14 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
                  update_dt, dropped);
     }
     thread_update_running = false;
-  });
+  };
 
-  // If we are single threaded, then run single threaded
-  // Otherwise detach this thread so it runs in the background!
+  // If we are single threaded, then run single threaded (here: a thread per IMU message only to join it cost
+  // a serial run seconds at 480 Hz). Otherwise detach this thread so it runs in the background!
   if (!_app->get_params().use_multi_threading_subs) {
-    thread.join();
+    process();
   } else {
-    thread.detach();
+    std::thread(process).detach();
   }
 }
 

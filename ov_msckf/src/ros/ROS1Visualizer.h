@@ -109,6 +109,10 @@ public:
   /// A serial run (ros1_serial_msckf) turns this off: every frame is processed, in order, and the run repeats.
   void set_drop_stale(bool drop) { drop_stale = drop; }
 
+  /// The IMU-rate odometry (a fast propagation at every IMU message): on by default; a serial run that only
+  /// records the updated poses turns it off.
+  void set_odometry(bool on) { odometry = on; }
+
   /// Waits until something subscribes to the IMU pose (a recorder started next to a serial run), at most timeout_s.
   /// Returns whether one did.
   bool wait_for_pose_subscriber(double timeout_s);
@@ -195,6 +199,9 @@ protected:
 
   // Ring: drop the stale frames when the processing falls behind (live), or not (serial runs)
   bool drop_stale = true;
+
+  // Publish the IMU-rate odometry (visualize_odometry)
+  bool odometry = true;
 
   // Ring stereo: per-stamp collection of the N camera images
   std::mutex ring_mtx;
