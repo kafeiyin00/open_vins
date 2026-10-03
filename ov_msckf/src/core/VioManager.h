@@ -96,8 +96,10 @@ public:
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
 
-  /// If we are initialized or not
-  bool initialized() { return is_initialized_vio && timelastupdate != -1; }
+  /// If we are initialized or not. A zero velocity update counts as an update: a still start (static init, ZUPT on)
+  /// only does ZUPTs until it moves, with no clones to run the MSCKF update on, and the estimate (gravity aligned, at
+  /// rest at the origin) is valid all along -- without this nothing is published until the platform moves.
+  bool initialized() { return is_initialized_vio && (timelastupdate != -1 || zupt_since_init); }
 
   /// Timestamp that the system was initialized at
   double initialized_time() { return startup_time; }
@@ -252,6 +254,7 @@ protected:
   // If we did a zero velocity update
   bool did_zupt_update = false;
   bool has_moved_since_zupt = false;
+  bool zupt_since_init = false; // a ZUPT has updated the state since initialization (see initialized())
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;
