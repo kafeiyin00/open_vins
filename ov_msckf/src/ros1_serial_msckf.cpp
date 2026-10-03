@@ -22,6 +22,10 @@
 #include <ros/ros.h>
 #include <rosbag/bag.h>
 #include <rosbag/view.h>
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <sensor_msgs/CompressedImage.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/Imu.h>
 
@@ -33,6 +37,24 @@
 #include "utils/dataset_reader.h"
 
 using namespace ov_msckf;
+
+// A camera message of the bag as a mono8 image: raw, or compressed (JPEG, or PNG of 8 or 16 bits -- the
+// RK3588_SLAM board records its cameras compressed) and decoded here. nullptr if it is neither.
+static sensor_msgs::ImageConstPtr to_image(const rosbag::MessageInstance &m) {
+  if (sensor_msgs::ImageConstPtr img = m.instantiate<sensor_msgs::Image>())
+    return img;
+  sensor_msgs::CompressedImage::ConstPtr c = m.instantiate<sensor_msgs::CompressedImage>();
+  if (!c)
+    return nullptr;
+  cv::Mat im = cv::imdecode(c->data, cv::IMREAD_UNCHANGED);
+  if (im.empty())
+    return nullptr;
+  if (im.channels() == 3)
+    cv::cvtColor(im, im, cv::COLOR_BGR2GRAY);
+  if (im.depth() == CV_16U)
+    im.convertTo(im, CV_8U, 1.0 / 256);
+  return cv_bridge::CvImage(c->header, "mono8", im).toImageMsg();
+}
 
 std::shared_ptr<VioManager> sys;
 std::shared_ptr<ROS1Visualizer> viz;
@@ -94,6 +116,20 @@ int main(int argc, char **argv) {
     topic_cameras.emplace_back(cam_topic);
     PRINT_DEBUG("[SERIAL]: cam: %s\n", cam_topic.c_str());
   }
+
+  // Ring stereo (use_stereo with > 2 cameras, the RK3588_SLAM fisheye ring): every camera message goes to
+  // callback_ring, which assembles the frames; none is dropped for falling behind, so a run repeats.
+  const bool ring = params.use_stereo && params.state_options.num_cameras > 2;
+  if (ring)
+    viz->set_drop_stale(false);
+
+  // A recorder of the poses started next to this node (wait_subscriber_s > 0): wait for it to connect before
+  // the first pose; and linger at the end (end_linger_s) so that the last poses reach it.
+  double wait_subscriber_s, end_linger_s;
+  nh->param<double>("wait_subscriber_s", wait_subscriber_s, 0.0);
+  nh->param<double>("end_linger_s", end_linger_s, 0.0);
+  if (wait_subscriber_s > 0 && !viz->wait_for_pose_subscriber(wait_subscriber_s))
+    PRINT_WARNING(YELLOW "[SERIAL]: nothing subscribed to the IMU pose after %.0f s, going on\n" RESET, wait_subscriber_s);
 
   // Location of the ROS bag we want to read in
   std::string path_to_bag;
@@ -217,6 +253,16 @@ int main(int argc, char **argv) {
       if (msgs.at(m).getTopic() != topic_cameras.at(cam_id))
         continue;
 
+      if (ring) {
+        sensor_msgs::ImageConstPtr img = to_image(msgs.at(m));
+        if (img)
+          viz->callback_ring(img, cam_id);
+        else
+          PRINT_WARNING(YELLOW "[SERIAL]: %s is neither sensor_msgs/Image nor a decodable CompressedImage\n" RESET,
+                        topic_cameras.at(cam_id).c_str());
+        break;
+      }
+
       // We have a matching camera topic here, now find the other cameras for this time
       // For each camera, we will find the nearest timestamp (within 0.02sec) that is greater than the current
       // If we are unable, then this message should just be skipped since it isn't a sync'ed pair!
@@ -258,13 +304,13 @@ int main(int argc, char **argv) {
       // Pass our data into our visualizer callbacks!
       // PRINT_DEBUG("processing cam = %.3f sec\n", msgs.at(m).getTime().toSec() - time_init.toSec());
       if (params.state_options.num_cameras == 1) {
-        viz->callback_monocular(msgs.at(camid_to_msg_index.at(0)).instantiate<sensor_msgs::Image>(), 0);
+        viz->callback_monocular(to_image(msgs.at(camid_to_msg_index.at(0))), 0);
       } else if (params.state_options.num_cameras == 2) {
         auto msg0 = msgs.at(camid_to_msg_index.at(0));
         auto msg1 = msgs.at(camid_to_msg_index.at(1));
         used_index.insert(camid_to_msg_index.at(0)); // skip this message
         used_index.insert(camid_to_msg_index.at(1)); // skip this message
-        viz->callback_stereo(msg0.instantiate<sensor_msgs::Image>(), msg1.instantiate<sensor_msgs::Image>(), 0, 1);
+        viz->callback_stereo(to_image(msg0), to_image(msg1), 0, 1);
       } else {
         PRINT_ERROR(RED "[SERIAL]: We currently only support 1 or 2 camera serial input....\n" RESET);
         return EXIT_FAILURE;
@@ -276,6 +322,8 @@ int main(int argc, char **argv) {
 
   // Final visualization
   viz->visualize_final();
+  if (end_linger_s > 0)
+    ros::WallDuration(end_linger_s).sleep();
 
   // Done!
   return EXIT_SUCCESS;

@@ -45,7 +45,11 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   image_transport::ImageTransport it(*_nh);
 
   // Setup pose and path publisher
-  pub_poseimu = nh->advertise<geometry_msgs::PoseWithCovarianceStamped>("poseimu", 2);
+  // pose_queue_size: 2 live; a serial run publishes as fast as it processes and sets more, so that a recorder
+  // of the poses misses none
+  int pose_queue_size = 2;
+  nh->param<int>("pose_queue_size", pose_queue_size, pose_queue_size);
+  pub_poseimu = nh->advertise<geometry_msgs::PoseWithCovarianceStamped>("poseimu", pose_queue_size);
   PRINT_DEBUG("Publishing: %s\n", pub_poseimu.getTopic().c_str());
   pub_odomimu = nh->advertise<nav_msgs::Odometry>("odomimu", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_odomimu.getTopic().c_str());
@@ -445,6 +449,13 @@ void ROS1Visualizer::visualize_final() {
   PRINT_INFO(REDPURPLE "TIME: %.3f seconds\n\n" RESET, (rT2 - rT1).total_microseconds() * 1e-6);
 }
 
+bool ROS1Visualizer::wait_for_pose_subscriber(double timeout_s) {
+  const ros::WallTime until = ros::WallTime::now() + ros::WallDuration(timeout_s);
+  while (ros::ok() && pub_poseimu.getNumSubscribers() == 0 && ros::WallTime::now() < until)
+    ros::WallDuration(0.05).sleep();
+  return pub_poseimu.getNumSubscribers() > 0;
+}
+
 void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
 
   // convert into correct format
@@ -497,7 +508,7 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
         std::lock_guard<std::mutex> lck(camera_queue_mtx);
         if (camera_queue.empty() || camera_queue.at(0).timestamp >= timestamp_imu_inC)
           break;
-        while (ring && camera_queue.size() > 1 && camera_queue.at(1).timestamp < timestamp_imu_inC) {
+        while (ring && drop_stale && camera_queue.size() > 1 && camera_queue.at(1).timestamp < timestamp_imu_inC) {
           camera_queue.pop_front();
           dropped++;
         }

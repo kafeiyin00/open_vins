@@ -105,6 +105,14 @@ public:
    */
   void visualize_final();
 
+  /// Live, a ring frame the processing has fallen behind on is dropped for the newest processable one (default).
+  /// A serial run (ros1_serial_msckf) turns this off: every frame is processed, in order, and the run repeats.
+  void set_drop_stale(bool drop) { drop_stale = drop; }
+
+  /// Waits until something subscribes to the IMU pose (a recorder started next to a serial run), at most timeout_s.
+  /// Returns whether one did.
+  bool wait_for_pose_subscriber(double timeout_s);
+
   /// Callback for inertial information
   void callback_inertial(const sensor_msgs::Imu::ConstPtr &msg);
 
@@ -184,6 +192,9 @@ protected:
 
   // Last camera message timestamps we have received (mapped by cam id)
   std::map<int, double> camera_last_timestamp;
+
+  // Ring: drop the stale frames when the processing falls behind (live), or not (serial runs)
+  bool drop_stale = true;
 
   // Ring stereo: per-stamp collection of the N camera images
   std::mutex ring_mtx;
