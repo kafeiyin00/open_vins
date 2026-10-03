@@ -186,7 +186,8 @@ void ROS1Visualizer::setup_subscribers(std::shared_ptr<ov_core::YamlParser> pars
       std::string cam_topic;
       _nh->param<std::string>("topic_camera" + std::to_string(i), cam_topic, "/cam" + std::to_string(i) + "/image_raw");
       parser->parse_external("relative_config_imucam", "cam" + std::to_string(i), "rostopic", cam_topic);
-      subs_cam.push_back(_nh->subscribe<sensor_msgs::Image>(cam_topic, 10, boost::bind(&ROS1Visualizer::callback_ring, this, _1, i)));
+      // Short queue: live, a frame that waited for the processing is stale anyway (see callback_inertial)
+      subs_cam.push_back(_nh->subscribe<sensor_msgs::Image>(cam_topic, 2, boost::bind(&ROS1Visualizer::callback_ring, this, _1, i)));
       PRINT_INFO("subscribing to cam (ring stereo): %s\n", cam_topic.c_str());
     }
   } else {
@@ -462,36 +463,55 @@ void ROS1Visualizer::callback_inertial(const sensor_msgs::Imu::ConstPtr &msg) {
   if (thread_update_running)
     return;
   thread_update_running = true;
-  std::thread thread([&] {
-    // Lock on the queue (prevents new images from appending)
-    std::lock_guard<std::mutex> lck(camera_queue_mtx);
-
+  // By value: the thread is detached and outlives this callback's message.
+  const double timestamp_imu = message.timestamp;
+  std::thread thread([this, timestamp_imu] {
     // Count how many unique image streams
-    std::map<int, bool> unique_cam_ids;
-    for (const auto &cam_msg : camera_queue) {
-      unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
-    }
-
-    // If we do not have enough unique cameras then we need to wait
-    // We should wait till we have one of each camera to ensure we propagate in the correct order
     auto params = _app->get_params();
     bool ring = (params.use_stereo && params.state_options.num_cameras > 2);
     size_t num_unique_cameras = (params.state_options.num_cameras == 2 || ring) ? 1 : params.state_options.num_cameras;
-    if (unique_cam_ids.size() == num_unique_cameras) {
-
-      // Loop through our queue and see if we are able to process any of our camera measurements
-      // We are able to process if we have at least one IMU measurement greater than the camera time
-      double timestamp_imu_inC = message.timestamp - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
-      while (!camera_queue.empty() && camera_queue.at(0).timestamp < timestamp_imu_inC) {
-        auto rT0_1 = boost::posix_time::microsec_clock::local_time();
-        double update_dt = 100.0 * (timestamp_imu_inC - camera_queue.at(0).timestamp);
-        _app->feed_measurement_camera(camera_queue.at(0));
-        visualize();
-        camera_queue.pop_front();
-        auto rT0_2 = boost::posix_time::microsec_clock::local_time();
-        double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
-        PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind)\n" RESET, time_total, 1.0 / time_total, update_dt);
+    {
+      std::lock_guard<std::mutex> lck(camera_queue_mtx);
+      std::map<int, bool> unique_cam_ids;
+      for (const auto &cam_msg : camera_queue) {
+        unique_cam_ids[cam_msg.sensor_ids.at(0)] = true;
       }
+      // If we do not have enough unique cameras then we need to wait
+      // We should wait till we have one of each camera to ensure we propagate in the correct order
+      if (unique_cam_ids.size() != num_unique_cameras) {
+        thread_update_running = false;
+        return;
+      }
+    }
+
+    // Process the camera measurements we have IMU for (at least one IMU measurement past the camera time).
+    // The queue is locked only to take a frame, not while it is processed: holding it made the image
+    // callbacks block, the subscriber queues fill up, and every frame processed ~10 frames late on a
+    // CPU slower than the camera rate. Live, a frame the processing has fallen behind is stale: in the
+    // ring (several cameras per frame), take the newest processable one and drop the older ones.
+    double timestamp_imu_inC = timestamp_imu - _app->get_state()->_calib_dt_CAMtoIMU->value()(0);
+    while (true) {
+      ov_core::CameraData cam_msg;
+      int dropped = 0;
+      {
+        std::lock_guard<std::mutex> lck(camera_queue_mtx);
+        if (camera_queue.empty() || camera_queue.at(0).timestamp >= timestamp_imu_inC)
+          break;
+        while (ring && camera_queue.size() > 1 && camera_queue.at(1).timestamp < timestamp_imu_inC) {
+          camera_queue.pop_front();
+          dropped++;
+        }
+        cam_msg = camera_queue.at(0);
+        camera_queue.pop_front();
+      }
+      auto rT0_1 = boost::posix_time::microsec_clock::local_time();
+      double update_dt = 1000.0 * (timestamp_imu_inC - cam_msg.timestamp);
+      _app->feed_measurement_camera(cam_msg);
+      visualize();
+      auto rT0_2 = boost::posix_time::microsec_clock::local_time();
+      double time_total = (rT0_2 - rT0_1).total_microseconds() * 1e-6;
+      PRINT_INFO(BLUE "[TIME]: %.4f seconds total (%.1f hz, %.2f ms behind, %d stale dropped)\n" RESET, time_total, 1.0 / time_total,
+                 update_dt, dropped);
     }
     thread_update_running = false;
   });
