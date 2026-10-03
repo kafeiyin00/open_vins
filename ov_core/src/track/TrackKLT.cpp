@@ -21,8 +21,11 @@
 
 #include "TrackKLT.h"
 
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <typeinfo>
 
 #include <cmath>
 #include <set>
@@ -1232,11 +1235,28 @@ const std::pair<cv::Mat, cv::Mat> &TrackKLT::get_ring_map(size_t cam_id_left, si
     return it->second;
   // Disk cache (OV_RING_MAP_CACHE=<dir>): the tables depend only on the calibration and the image size, and the
   // per-pixel undistortion below takes ~0.2 s per pair on a Xeon but ~20 s on an RK3588 (70 s before the first frame,
-  // paid again at every in-flight restart).
+  // paid again at every in-flight restart). The file name carries a hash of everything the tables are built from
+  // (both cameras' model and intrinsics, the pair rotation), so a new calibration never loads an old table.
   std::string cache_path;
   if (const char *dir = std::getenv("OV_RING_MAP_CACHE")) {
+    uint64_t hash = 1469598103934665603ULL; // FNV-1a
+    auto mix = [&hash](const void *p, size_t n) {
+      for (size_t i = 0; i < n; i++)
+        hash = (hash ^ ((const unsigned char *)p)[i]) * 1099511628211ULL;
+    };
+    for (size_t id : {cam_id_left, cam_id_right}) {
+      const CamBase &cam = *camera_calib.at(id);
+      std::string model = typeid(cam).name();
+      Eigen::MatrixXd values = camera_calib.at(id)->get_value();
+      mix(model.data(), model.size());
+      mix(values.data(), sizeof(double) * values.size());
+    }
+    const Eigen::Matrix3d &R = pair_rotations.at(key);
+    mix(R.data(), sizeof(double) * 9);
+    char hex[17];
+    std::snprintf(hex, sizeof(hex), "%016llx", (unsigned long long)hash);
     cache_path = std::string(dir) + "/ring_" + std::to_string(cam_id_left) + "_" + std::to_string(cam_id_right) + "_" +
-                 std::to_string(rows) + "x" + std::to_string(cols) + ".bin";
+                 std::to_string(rows) + "x" + std::to_string(cols) + "_" + hex + ".bin";
     std::ifstream f(cache_path, std::ios::binary);
     int32_t hdr[2] = {0, 0};
     if (f && f.read((char *)hdr, sizeof(hdr)) && hdr[0] == rows && hdr[1] == cols) {
