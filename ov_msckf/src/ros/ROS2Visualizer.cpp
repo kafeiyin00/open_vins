@@ -550,16 +550,8 @@ void ROS2Visualizer::callback_monocular(const sensor_msgs::msg::Image::SharedPtr
 
 void ROS2Visualizer::callback_ring(const sensor_msgs::msg::Image::SharedPtr msg0, int cam_id0) {
 
-  // Stamp key; all cameras of one frame share the stamp exactly
-  double timestamp = std::round((msg0->header.stamp.sec + msg0->header.stamp.nanosec * 1e-9) * 1e6) / 1e6;
+  double timestamp = msg0->header.stamp.sec + msg0->header.stamp.nanosec * 1e-9;
   int N = _app->get_params().state_options.num_cameras;
-  {
-    std::lock_guard<std::mutex> lck(ring_mtx);
-    double time_delta = 1.0 / _app->get_params().track_frequency;
-    bool started = (ring_buffer.find(timestamp) != ring_buffer.end());
-    if (!started && ring_last_timestamp >= 0 && timestamp < ring_last_timestamp + time_delta)
-      return;
-  }
 
   cv_bridge::CvImageConstPtr cv_ptr;
   try {
@@ -569,7 +561,18 @@ void ROS2Visualizer::callback_ring(const sensor_msgs::msg::Image::SharedPtr msg0
     return;
   }
 
+  // All cameras of one frame are stamped with the same trigger edge, but each
+  // converts it with its own clock read, so the stamps differ by up to ~1 us
+  // (RK3588_SLAM board: median 0.3 us, max 0.7 us) and an exact or us-rounded
+  // key splits about a quarter of the frames. Join a frame within ring_tol.
+  const double ring_tol = 1e-3;
   std::lock_guard<std::mutex> lck(ring_mtx);
+  auto frame = ring_buffer.lower_bound(timestamp - ring_tol);
+  if (frame != ring_buffer.end() && frame->first <= timestamp + ring_tol) {
+    timestamp = frame->first;
+  } else if (ring_last_timestamp >= 0 && timestamp < ring_last_timestamp + 1.0 / _app->get_params().track_frequency) {
+    return;
+  }
   ring_buffer[timestamp][cam_id0] = cv_ptr->image.clone();
   if ((int)ring_buffer[timestamp].size() < N)
     return;
