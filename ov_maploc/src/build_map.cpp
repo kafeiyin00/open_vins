@@ -8,7 +8,7 @@
  * (VirtualView, OrbExtractor): what is matched online is what was mapped.
  *
  *   maploc_build --keyframes DIR --calib kalibr_imucam_chain.yaml --masks DIR --out map.bin
- *                [--report report.json] [--preview preview.json] [--threads N] [options below]
+ *                [--report report.json] [--preview preview.json] [--threads N] [--poses poses.txt] [options below]
  *
  * preview.json, for a COLMAP-like view of the result: landmarks [x, y, z, grey] (grey = the
  * views' pixel at the landmark, averaged), keyframes [x, y, z, qw, qx, qy, qz] after the
@@ -19,6 +19,10 @@
  * DIR/index.txt:   start tx ty tz qx qy qz qw                 first VIO pose of the run
  *                  kf stamp tx ty tz qx qy qz qw img0 .. imgN  one keyframe: VIO pose, one image per camera
  * Poses as OpenVINS publishes /ov_msckf/poseimu (the IMU in its global frame, the quaternion read as Hamilton).
+ *
+ * --poses poses.txt: the keyframe poses fixed to these (workers/sfm/map_sfm.py: COLMAP-style SfM of the same
+ * keyframes, docs/MAPPING.md), "kf stamp tx ty tz qx qy qz qw" in index.txt's order. No loop closure then,
+ * and the bundle adjustment moves the landmarks only: the map is exported on the SfM's poses.
  *
  * 1. per keyframe and camera: virtual pinhole view, ORB
  * 2. loop closure (--loop 1): tracks of nearby keyframes (within 20 s) triangulated from the VIO;
@@ -306,6 +310,7 @@ int main(int argc, char **argv) {
                  "       [--orb-n 2000] [--pair-radius 5] [--pair-axis-deg 60] [--pairs-per-image 12] [--selftest 100]\n"
                  "       [--loop 1] [--vocab-k 1000] [--loop-min-dt 20] [--loop-min-score 0.3] [--loop-min-inliers 40]\n"
                  "       [--loop-obs loops.txt (ros/pc/loopnet; missing: the bag of words)]\n"
+                 "       [--poses poses.txt (keyframe poses fixed to these: SfM; no loop closure)]\n"
                  "   or: maploc_build --keyframes DIR --calib ... [--masks DIR] --dump-views DIR (the views for loopnet)\n";
     return 2;
   }
@@ -383,6 +388,35 @@ int main(int argc, char **argv) {
       throw std::runtime_error("need at least 3 keyframes, index.txt has " + std::to_string(K));
     if (!have_start)
       T_start = kfs[0].T_vio;
+    // --poses: the keyframes where the SfM put them
+    const std::string poses_file = a.get("--poses");
+    std::vector<Eigen::Matrix4d> T_fixed;
+    if (!poses_file.empty()) {
+      std::ifstream pf(poses_file);
+      if (!pf)
+        throw std::runtime_error("cannot open " + poses_file);
+      for (std::string line; std::getline(pf, line);) {
+        std::istringstream ss(line);
+        std::string tag;
+        if (!(ss >> tag) || tag != "kf")
+          continue;
+        double stamp, v[7];
+        ss >> stamp;
+        for (double &x : v)
+          ss >> x;
+        if (ss.fail())
+          throw std::runtime_error("bad line in " + poses_file + ": " + line);
+        const size_t k = T_fixed.size();
+        if (k >= kfs.size() || std::abs(stamp - kfs[k].stamp) > 1e-3)
+          throw std::runtime_error(poses_file + " does not match index.txt at keyframe " + std::to_string(k));
+        T_fixed.push_back(pose_from(v));
+      }
+      if (T_fixed.size() != kfs.size())
+        throw std::runtime_error(poses_file + " has " + std::to_string(T_fixed.size()) + " keyframes, index.txt " +
+                                 std::to_string(kfs.size()));
+      P.loop = 0;
+    }
+    const bool fixed = !T_fixed.empty();
     std::printf("maploc_build: %d keyframes x %d cameras, views %d px / %.0f deg, ORB %d per view, %d threads\n", K, C, P.view_size,
                 P.view_fov, P.orb_n, P.threads);
 
@@ -467,6 +501,8 @@ int main(int argc, char **argv) {
     std::vector<Eigen::Matrix4d> T_vio(K), T_kf(K);
     for (int k = 0; k < K; k++)
       T_vio[k] = T_kf[k] = kfs[k].T_vio;
+    if (fixed)
+      T_kf = T_fixed;
 
     // ---------------------------------------------------------------- 2. pairs (of the given poses, within max_dt s)
     auto select_pairs = [&](const std::vector<Eigen::Matrix4d> &Tk, double max_dt) {
@@ -650,7 +686,9 @@ int main(int argc, char **argv) {
     std::vector<LoopEdge> loops;
     int loop_cands = 0, loops_used = 0;
     double pg_max_move = 0, pg_end_gap_vio = 0, pg_end_gap = 0;
-    std::string loop_method = P.loop ? "none" : "off", loop_note;
+    std::string loop_method = fixed ? "sfm" : P.loop ? "none" : "off", loop_note;
+    if (fixed)
+      loop_note = "keyframe poses from SfM: loops closed there";
     if (P.loop && K >= 10) {
       t0 = now_s();
       std::vector<double> path(K, 0.0);
@@ -994,33 +1032,43 @@ int main(int argc, char **argv) {
                                        new ReprojCost(R_cam_imu[c], t_cam_imu[c], vf, vc, Eigen::Vector2d(pt.x, pt.y))),
                                    new ceres::HuberLoss(P.huber_px), aa[k].data(), pp[k].data(), Xs[ti].data());
         }
-      for (int k = 0; k + 1 < K; k++) {
+      for (int k = 0; k + 1 < K && !fixed; k++) {
         const Eigen::Matrix4d T_ab = T_inv(kfs[k].T_vio) * kfs[k + 1].T_vio;
         const double st = P.rel_sigma_t + P.rel_sigma_t_frac * T_ab.block<3, 1>(0, 3).norm();
         problem.AddResidualBlock(new ceres::AutoDiffCostFunction<RelPoseCost, 6, 3, 3, 3, 3>(
                                      new RelPoseCost(T_ab, st, P.rel_sigma_r_deg * M_PI / 180.0)),
                                  nullptr, aa[k].data(), pp[k].data(), aa[k + 1].data(), pp[k + 1].data());
       }
-      for (int k = 0; k < K; k++) {
+      for (int k = 0; k < K && !fixed; k++) {
         const Eigen::Vector3d g = kfs[k].T_vio.block<3, 3>(0, 0).transpose() * Eigen::Vector3d::UnitZ();
         problem.AddResidualBlock(new ceres::AutoDiffCostFunction<TiltCost, 3, 3>(new TiltCost(g, P.tilt_sigma_deg * M_PI / 180.0)),
                                  nullptr, aa[k].data());
       }
       problem.SetParameterBlockConstant(aa[0].data()); // gauge: the first keyframe stays where the VIO put it
       problem.SetParameterBlockConstant(pp[0].data());
+      for (int k = 1; k < K && fixed; k++) { // --poses: the landmarks alone
+        if (problem.HasParameterBlock(aa[k].data()))
+          problem.SetParameterBlockConstant(aa[k].data());
+        if (problem.HasParameterBlock(pp[k].data()))
+          problem.SetParameterBlockConstant(pp[k].data());
+      }
       ceres::Solver::Options opt;
       opt.linear_solver_type = ceres::SPARSE_SCHUR;
       auto *ordering = new ceres::ParameterBlockOrdering;
       for (auto &x : Xs)
         if (problem.HasParameterBlock(x.data()))
           ordering->AddElementToGroup(x.data(), 0);
-      for (int k = 0; k < K; k++) {
+      for (int k = 0; k < K && !fixed; k++) {
         if (problem.HasParameterBlock(aa[k].data()))
           ordering->AddElementToGroup(aa[k].data(), 1);
         if (problem.HasParameterBlock(pp[k].data()))
           ordering->AddElementToGroup(pp[k].data(), 1);
       }
-      opt.linear_solver_ordering.reset(ordering);
+      if (fixed) { // every landmark on its own
+        delete ordering;
+        opt.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+      } else
+        opt.linear_solver_ordering.reset(ordering);
       opt.max_num_iterations = P.ba_iters;
       opt.num_threads = P.threads;
       opt.function_tolerance = 1e-6;
@@ -1065,9 +1113,9 @@ int main(int argc, char **argv) {
       dpos.push_back((T_kf[k].block<3, 1>(0, 3) - kfs[k].T_vio.block<3, 1>(0, 3)).norm());
       dyaw.push_back(std::abs(wrap_rad(yaw_of(T_kf[k].block<3, 3>(0, 0)) - yaw_of(kfs[k].T_vio.block<3, 3>(0, 0)))) * 180 / M_PI);
     }
-    std::printf("reprojection: mean %.2f px / median %.2f px before BA, %.2f / %.2f after; keyframes moved by BA: median %.3f m, max %.3f m, "
+    std::printf("reprojection: mean %.2f px / median %.2f px before BA, %.2f / %.2f after; keyframes moved from the VIO%s: median %.3f m, max %.3f m, "
                 "yaw max %.2f deg\n",
-                err0_mean, err0_med, err1_mean, err1_med, median(dpos), *std::max_element(dpos.begin(), dpos.end()),
+                err0_mean, err0_med, err1_mean, err1_med, fixed ? " (SfM)" : " by BA", median(dpos), *std::max_element(dpos.begin(), dpos.end()),
                 *std::max_element(dyaw.begin(), dyaw.end()));
 
     // ---------------------------------------------------------------- 6. the map
@@ -1209,7 +1257,7 @@ int main(int argc, char **argv) {
     const std::string rep = a.get("--report");
     if (!rep.empty()) {
       std::ofstream f(rep);
-      f << "{\n \"keyframes\": " << K << ", \"cameras\": " << C << ", \"images\": " << I << ",\n"
+      f << "{\n \"poses\": \"" << (fixed ? "sfm" : "ba") << "\", \"keyframes\": " << K << ", \"cameras\": " << C << ", \"images\": " << I << ",\n"
         << " \"keypoints_per_view\": " << jnum(double(base[I]) / I, 1) << ",\n"
         << " \"pairs\": " << pairs.size() << ", \"pairs_verified\": " << pairs_ok << ", \"pairs_revisit\": " << loop_pairs
         << ", \"matches\": " << n_match << ",\n"
