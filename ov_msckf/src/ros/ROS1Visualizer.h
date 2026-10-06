@@ -158,6 +158,7 @@ protected:
   image_transport::Publisher it_pub_tracks, it_pub_loop_img_depth, it_pub_loop_img_depth_color;
   ros::Publisher pub_poseimu, pub_odomimu, pub_pathimu;
   ros::Publisher pub_points_msckf, pub_points_slam, pub_points_aruco, pub_points_sim;
+  ros::Publisher pub_feat_tokens;
   ros::Publisher pub_loop_pose, pub_loop_point, pub_loop_extrinsic, pub_loop_intrinsics;
   std::shared_ptr<tf::TransformBroadcaster> mTfBr;
 
@@ -224,6 +225,14 @@ protected:
   // Files and if we should save total state
   bool save_total_state = false;
   std::ofstream of_state_est, of_state_std, of_state_gt;
+
+  // Feature tokens (VioManager::FeatToken) of every update written to this file when the param tokens_out is set
+  // (binary, little endian, per update: double t, p_IinG[3], R_GtoI[9] row-major, int32 n, then n x 9 doubles
+  // x y z kind track_len n_obs cams first_t id)
+  std::ofstream of_tokens;
+
+  /// The tokens of the current state: feat_tokens topic (when subscribed) and the tokens_out file
+  void publish_feature_tokens();
 };
 
 } // namespace ov_msckf

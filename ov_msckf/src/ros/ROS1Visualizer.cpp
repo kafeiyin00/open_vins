@@ -61,6 +61,15 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
   PRINT_DEBUG("Publishing: %s\n", pub_points_msckf.getTopic().c_str());
   pub_points_slam = nh->advertise<sensor_msgs::PointCloud2>("points_slam", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_msckf.getTopic().c_str());
+  pub_feat_tokens = nh->advertise<sensor_msgs::PointCloud2>("feat_tokens", 2);
+  PRINT_DEBUG("Publishing: %s\n", pub_feat_tokens.getTopic().c_str());
+  std::string tokens_out;
+  nh->param<std::string>("tokens_out", tokens_out, "");
+  if (!tokens_out.empty()) {
+    of_tokens.open(tokens_out, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!of_tokens.is_open())
+      PRINT_ERROR(RED "unable to open tokens_out %s\n" RESET, tokens_out.c_str());
+  }
   pub_points_aruco = nh->advertise<sensor_msgs::PointCloud2>("points_aruco", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_aruco.getTopic().c_str());
   pub_points_sim = nh->advertise<sensor_msgs::PointCloud2>("points_sim", 2);
@@ -769,7 +778,74 @@ void ROS1Visualizer::publish_images() {
   it_pub_tracks.publish(exl_msg);
 }
 
+void ROS1Visualizer::publish_feature_tokens() {
+  const bool topic = pub_feat_tokens.getNumSubscribers() > 0;
+  if (!topic && !of_tokens.is_open())
+    return;
+  // SLAM features in the state + MSCKF features of the last update, as ROS2Visualizer's feat_tokens
+  std::vector<VioManager::FeatToken> toks = _app->get_feature_tokens_SLAM();
+  std::vector<VioManager::FeatToken> toks_m = _app->get_good_feature_tokens_MSCKF();
+  toks.insert(toks.end(), toks_m.begin(), toks_m.end());
+  auto state = _app->get_state();
+  if (topic) {
+    sensor_msgs::PointCloud2 cloud;
+    cloud.header.frame_id = "global";
+    cloud.header.stamp = ros::Time(state->_timestamp);
+    cloud.height = 1;
+    cloud.width = (uint32_t)toks.size();
+    cloud.is_bigendian = false;
+    cloud.is_dense = true;
+    sensor_msgs::PointCloud2Modifier mod(cloud);
+    mod.setPointCloud2Fields(9, "x", 1, sensor_msgs::PointField::FLOAT32, "y", 1, sensor_msgs::PointField::FLOAT32, "z", 1,
+                             sensor_msgs::PointField::FLOAT32, "kind", 1, sensor_msgs::PointField::FLOAT32, "track_len", 1,
+                             sensor_msgs::PointField::FLOAT32, "n_obs", 1, sensor_msgs::PointField::FLOAT32, "cams", 1,
+                             sensor_msgs::PointField::FLOAT32, "first_t", 1, sensor_msgs::PointField::FLOAT64, "id", 1,
+                             sensor_msgs::PointField::FLOAT64);
+    mod.resize(toks.size());
+    sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x"), iy(cloud, "y"), iz(cloud, "z"), ik(cloud, "kind"), it(cloud, "track_len"),
+        in(cloud, "n_obs"), ic(cloud, "cams");
+    sensor_msgs::PointCloud2Iterator<double> ift(cloud, "first_t"), iid(cloud, "id");
+    for (auto const &tok : toks) {
+      *ix = (float)tok.p_FinG(0);
+      *iy = (float)tok.p_FinG(1);
+      *iz = (float)tok.p_FinG(2);
+      *ik = (float)tok.kind;
+      *it = tok.track_len;
+      *in = (float)tok.n_obs;
+      *ic = (float)tok.cams;
+      *ift = tok.first_t;
+      *iid = (double)tok.id;
+      ++ix; ++iy; ++iz; ++ik; ++it; ++in; ++ic; ++ift; ++iid;
+    }
+    pub_feat_tokens.publish(cloud);
+  }
+  if (of_tokens.is_open()) {
+    double head[13];
+    head[0] = state->_timestamp;
+    Eigen::Vector3d p = state->_imu->pos();
+    Eigen::Matrix3d R = state->_imu->Rot();
+    for (int k = 0; k < 3; k++)
+      head[1 + k] = p(k);
+    for (int r = 0; r < 3; r++)
+      for (int k = 0; k < 3; k++)
+        head[4 + 3 * r + k] = R(r, k);
+    int32_t n = (int32_t)toks.size();
+    of_tokens.write((const char *)head, sizeof(head));
+    of_tokens.write((const char *)&n, sizeof(n));
+    for (auto const &tok : toks) {
+      double row[9] = {tok.p_FinG(0), tok.p_FinG(1), tok.p_FinG(2), (double)tok.kind, (double)tok.track_len,
+                       (double)tok.n_obs, (double)tok.cams, tok.first_t, (double)tok.id};
+      of_tokens.write((const char *)row, sizeof(row));
+    }
+    of_tokens.flush();
+  }
+}
+
 void ROS1Visualizer::publish_features() {
+
+  // Tokens first: they do not depend on the point-cloud subscribers below
+  if (_app->initialized())
+    publish_feature_tokens();
 
   // Check if we have subscribers
   if (pub_points_msckf.getNumSubscribers() == 0 && pub_points_slam.getNumSubscribers() == 0 && pub_points_aruco.getNumSubscribers() == 0 &&
