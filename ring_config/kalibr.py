@@ -24,8 +24,28 @@ import re
 
 import yaml
 
-RESOLUTION = {'cn2': (1280, 800), 'cn3': (1280, 800), 'cn4': (1280, 800),
-              'cn5': (1280, 800), 'cn6': (1280, 800), 'cn7': (640, 512)}
+# cn2-cn5: AR0234 colour fisheyes since 2026-10-14 (OV9281 1280x800 before;
+# a calibration of those is now refused); cn6 unchanged as far as known
+RESOLUTION = {'cn2': (1920, 1200), 'cn3': (1920, 1200), 'cn4': (1920, 1200),
+              'cn5': (1920, 1200), 'cn6': (1280, 800), 'cn7': (640, 512)}
+# Our fisheyes reach past 180 deg: their lens model is trusted only this many
+# px around the image centre -- the radius Kalibr's corners were limited to
+# (calib-web's "角点最大半径", KALIBR_MAX_CORNER_RADIUS), ~70 deg off-axis
+# on average and <= ~80 deg with the principal point's offset. By resolution,
+# i.e. by sensor + lens.
+CALIB_RADIUS = {(1280, 800): 330.0,     # OV9281, measured 2026-10-02
+                # AR0234: f ~620 px, principal points up to 106 px left of the centre
+                # (4camera_v1.bag, 2026-10-15), so <= 74-79 deg off-axis. 600 kept only
+                # <= ~65 deg, and beyond it that calibration was 1-15 px off this one's
+                (1920, 1200): 750.0}
+
+
+def calib_radius(w, h):
+    """The trusted radius for a w x h camera: the table's, else the largest
+    circle in the image."""
+    return CALIB_RADIUS.get((int(w), int(h)), min(int(w), int(h)) / 2.0)
+
+
 TOPIC_RE = re.compile(r'^/?(cn[2-7])(/|$)')
 
 
@@ -34,7 +54,7 @@ class KalibrError(ValueError):
 
 
 IMU_TOPIC = '/imu/data'
-IMU_RATE = 480.0
+IMU_RATE = 300.0     # 480 Hz before 2026-10-14 (the board's trigger grid: 10 IMU samples per frame at 30 Hz)
 IMU_KEYS = ('accelerometer_noise_density', 'accelerometer_random_walk',
             'gyroscope_noise_density', 'gyroscope_random_walk')
 
