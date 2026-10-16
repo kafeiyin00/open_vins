@@ -850,7 +850,11 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
 
 void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, const cv::Mat &mask0,
                                         const cv::Mat &mask1, size_t cam_id_left, size_t cam_id_right, std::vector<cv::KeyPoint> &pts0,
-                                        std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1) {
+                                        std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1,
+                                        const std::vector<cv::Mat> *warped_pyr) {
+  auto now = [] { return boost::posix_time::microsec_clock::local_time(); };
+  auto secs = [](const boost::posix_time::ptime &a, const boost::posix_time::ptime &b) { return (b - a).total_microseconds() * 1e-6; };
+  boost::posix_time::ptime tp0 = now();
 
   // Create a 2D occupancy grid for this current image
   // Note that we scale this down, so that each grid point is equal to a set of pixels
@@ -969,6 +973,7 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
       pts0_new.push_back(kpt.pt);
     }
 
+    ring_t_fast0 += secs(tp0, now());
     // Cross-camera matching. Candidates are the NEW left detections plus every
     // existing left track that has no observation in the right camera yet.
     // The right image is 90 deg away, so instead of tracking between the two
@@ -989,9 +994,15 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
     }
     if (have_rot) {
       std::set<size_t> ids_right(ids1.begin(), ids1.end());
+      auto &retry = ring_retry[{cam_id_left, cam_id_right}];
       for (size_t i = 0; i < pts0.size(); i++) {
         if (ids_right.count(ids0.at(i)))
           continue;
+        if (ring_retry_frames > 0) {
+          auto r = retry.find(ids0.at(i));
+          if (r != retry.end() && r->second > ring_frame)
+            continue;
+        }
         cand_pts0.push_back(pts0.at(i).pt);
         cand_new.push_back(-1);
         cand_ids.push_back(ids0.at(i));
@@ -1039,8 +1050,11 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
         dst_pts.push_back(cand_pts1.at(i));
       }
       if (!src_pts.empty()) {
+        boost::posix_time::ptime tw0 = now();
         std::vector<cv::Mat> srcpyr;
-        if (have_rot) {
+        if (have_rot && warped_pyr && !warped_pyr->empty()) {
+          srcpyr = *warped_pyr;
+        } else if (have_rot) {
           const auto &maps = get_ring_map(cam_id_left, cam_id_right, img1pyr.at(0).rows, img1pyr.at(0).cols);
           cv::Mat warped;
           cv::remap(img0pyr.at(0), warped, maps.first, maps.second, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
@@ -1048,6 +1062,8 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
         } else {
           srcpyr = img0pyr;
         }
+        boost::posix_time::ptime tw1 = now();
+        ring_t_warp += secs(tw0, tw1);
         std::vector<uchar> st_f, st_b;
         std::vector<float> err_f, err_b;
         cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
@@ -1056,6 +1072,7 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
         std::vector<cv::Point2f> back_pts = src_pts;
         cv::calcOpticalFlowPyrLK(img1pyr, srcpyr, dst_pts, back_pts, st_b, err_b, win_size, pyr_levels, term_crit,
                                  cv::OPTFLOW_USE_INITIAL_FLOW);
+        ring_t_klt += secs(tw1, now());
         double cos_max = std::cos(ring_max_angle_deg * M_PI / 180.0);
         for (size_t k = 0; k < src_pts.size(); k++) {
           size_t i = src_idx[k];
@@ -1083,6 +1100,17 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
       PRINT_ALL("[RING-PAIR] cam%zu->cam%zu rot=%d: %d new + %d existing candidates, %d seeded, %d klt, %d fb, %d angle -> stereo\n",
                 cam_id_left, cam_id_right, (int)have_rot, (int)kpts0_new.size(), (int)(cand_pts0.size() - kpts0_new.size()),
                 n_seeded_total, n_klt, n_fb, n_ang);
+
+      // An existing track that did not make it into the right camera waits ring_retry_frames before the next try
+      if (have_rot && ring_retry_frames > 0) {
+        auto &retry = ring_retry[{cam_id_left, cam_id_right}];
+        for (size_t i = 0; i < cand_pts0.size(); i++)
+          if (cand_new[i] < 0 && !match_ok[i])
+            retry[cand_ids[i]] = ring_frame + ring_retry_frames;
+        if (ring_frame % 64 == 0) // forget the ids that are long gone
+          for (auto r = retry.begin(); r != retry.end();)
+            r = (r->second < ring_frame) ? retry.erase(r) : std::next(r);
+      }
 
       // Record: new features go to the left (and to the right if matched), existing tracks gain a right observation
       for (size_t i = 0; i < cand_pts0.size(); i++) {
@@ -1183,8 +1211,9 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
 
   // RIGHT: if we need features we should extract them in the current frame
   // RIGHT: note that we don't track them to the left as we already did left->right tracking above
+  boost::posix_time::ptime tr0 = now();
   int num_featsneeded_1 = num_features - (int)pts1.size();
-  if (num_featsneeded_1 > std::min(20, (int)(min_feat_percent * num_features))) {
+  if (ring_right_fast && num_featsneeded_1 > std::min(20, (int)(min_feat_percent * num_features))) {
 
     // This is old extraction code that would extract from the whole image
     // This can be slow as this will recompute extractions for grid areas that we have max features already
@@ -1225,6 +1254,7 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
       grid_2d_close1.at<uint8_t>(y_grid, x_grid) = 255;
     }
   }
+  ring_t_fast1 += secs(tr0, now());
 }
 
 const std::pair<cv::Mat, cv::Mat> &TrackKLT::get_ring_map(size_t cam_id_left, size_t cam_id_right, int rows, int cols) {
@@ -1316,6 +1346,19 @@ void TrackKLT::feed_ring(const CameraData &message) {
   std::vector<std::unique_lock<std::mutex>> locks;
   for (size_t k = 0; k < N; k++)
     locks.emplace_back(mtx_feeds.at(cams[k]));
+  if (ring_parallel_warp < 0) {
+    auto env = [](const char *name, int dflt) {
+      const char *v = std::getenv(name);
+      return v && *v ? std::atoi(v) : dflt;
+    };
+    ring_parallel_warp = env("OV_RING_PARALLEL_WARP", 1);
+    ring_retry_frames = std::max(0, env("OV_RING_RETRY_FRAMES", 0));
+    ring_right_fast = env("OV_RING_RIGHT_FAST", 1);
+    PRINT_INFO("[RING]: parallel warp %d, retry a failed cross-camera match after %d frames, right-image top-up %d\n",
+               ring_parallel_warp, ring_retry_frames, ring_right_fast);
+  }
+  ring_frame++;
+  ring_t_fast0 = ring_t_warp = ring_t_klt = ring_t_fast1 = 0;
 
   std::vector<cv::Mat> imgs(N), masks(N);
   std::vector<std::vector<cv::Mat>> pyrs(N);
@@ -1363,10 +1406,30 @@ void TrackKLT::feed_ring(const CameraData &message) {
     ids_old[k] = ids_last[cams[k]];
     pts_before += (int)pts_old[k].size();
   }
+  // Every pair's left image rendered in its right camera, all at once: the pair loop below has to run in
+  // order, the warps do not depend on it
+  std::vector<std::vector<cv::Mat>> warped(N);
+  if (ring_parallel_warp) {
+    boost::posix_time::ptime tw0 = boost::posix_time::microsec_clock::local_time();
+    parallel_for_(cv::Range(0, (int)N), LambdaBody([&](const cv::Range &range) {
+                    for (int k = range.start; k < range.end; k++) {
+                      size_t L = cams[k], R = cams[(k + 1) % N];
+                      if (!pair_rotations.count({L, R}))
+                        continue;
+                      const cv::Mat &right = img_pyramid_last[R].at(0);
+                      const auto &maps = get_ring_map(L, R, right.rows, right.cols);
+                      cv::Mat w;
+                      cv::remap(img_pyramid_last[L].at(0), w, maps.first, maps.second, cv::INTER_LINEAR, cv::BORDER_CONSTANT,
+                                cv::Scalar(0));
+                      cv::buildOpticalFlowPyramid(w, warped[k], win_size, pyr_levels);
+                    }
+                  }));
+    ring_t_warp += (boost::posix_time::microsec_clock::local_time() - tw0).total_microseconds() * 1e-6;
+  }
   for (size_t k = 0; k < N; k++) {
     size_t L = k, R = (k + 1) % N;
     perform_detection_pair(img_pyramid_last[cams[L]], img_pyramid_last[cams[R]], img_mask_last[cams[L]], img_mask_last[cams[R]], cams[L],
-                           cams[R], pts_old[L], pts_old[R], ids_old[L], ids_old[R]);
+                           cams[R], pts_old[L], pts_old[R], ids_old[L], ids_old[R], ring_parallel_warp ? &warped[k] : nullptr);
   }
   int pts_after = 0;
   for (size_t k = 0; k < N; k++)
@@ -1438,6 +1501,31 @@ void TrackKLT::feed_ring(const CameraData &message) {
   PRINT_ALL("[TIME-KLT]: %.4f seconds for feature DB update (%d features, %d seen by 2+ cameras)\n",
             (rT6 - rT5).total_microseconds() * 1e-6, total, shared);
   PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", (rT6 - rT1).total_microseconds() * 1e-6);
+  PRINT_ALL("[TIME-KLT]: ring detection stages %.4f left FAST, %.4f warp, %.4f cross KLT, %.4f right FAST\n", ring_t_fast0, ring_t_warp,
+            ring_t_klt, ring_t_fast1);
+
+  // One line every 5 s at INFO, so the board's vio.log shows what the ring stereo is doing
+  RingStats &rs = ring_stats;
+  if (rs.t0 < 0)
+    rs.t0 = message.timestamp;
+  rs.frames++;
+  rs.features += total;
+  rs.shared += shared;
+  rs.detected += pts_after - pts_before;
+  rs.t_det += (rT3 - rT2).total_microseconds() * 1e-6;
+  rs.t_fast0 += ring_t_fast0;
+  rs.t_warp += ring_t_warp;
+  rs.t_klt += ring_t_klt;
+  rs.t_fast1 += ring_t_fast1;
+  if (message.timestamp - rs.t0 >= 5.0) {
+    double n = rs.frames;
+    PRINT_INFO("[RING]: %d frames in %.1f s, per frame %.0f features (%.1f seen by 2+ cameras, %.1f new), ring detection %.1f ms "
+               "(left FAST %.1f, warp %.1f, cross KLT %.1f, right FAST %.1f)\n",
+               rs.frames, message.timestamp - rs.t0, rs.features / n, rs.shared / n, rs.detected / n, 1000 * rs.t_det / n,
+               1000 * rs.t_fast0 / n, 1000 * rs.t_warp / n, 1000 * rs.t_klt / n, 1000 * rs.t_fast1 / n);
+    rs = RingStats();
+    rs.t0 = message.timestamp;
+  }
 }
 
 void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
