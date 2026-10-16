@@ -11,7 +11,8 @@
  *                [--report report.json] [--preview preview.json] [--threads N] [--poses poses.txt] [options below]
  *
  * preview.json, for a COLMAP-like view of the result: landmarks [x, y, z, grey] (grey = the
- * views' pixel at the landmark, averaged), keyframes [x, y, z, qw, qx, qy, qz] after the
+ * views' pixel at the landmark, averaged), or [x, y, z, grey, r, g, b] when the keyframe images are
+ * colour (the AR0234's, since 2026-10-14; grey is still the greyscale decode's), keyframes [x, y, z, qw, qx, qy, qz] after the
  * bundle adjustment, vio [x, y, z, yaw] before it, loops [i, j, inliers, used] (keyframe i
  * recognized keyframe j), start, the rig (each camera's T_imu_cam),
  * each keyframe's image files and the landmarks it sees.
@@ -132,6 +133,7 @@ struct Image {
   std::vector<cv::KeyPoint> kps;
   cv::Mat desc;
   std::vector<uint8_t> grey; ///< the view's pixel at each keypoint (the preview's point colours)
+  std::vector<cv::Vec3b> bgr; ///< the same from the colour image, when the keyframe image is colour
   std::vector<uchar> thumb;  ///< the view as a small JPEG (map.bin kf_thumbs, for the board's match display)
 };
 
@@ -427,14 +429,19 @@ int main(int argc, char **argv) {
     // intrinsics, rig, VIO poses) for ros/pc/loopnet, then stop
     const std::string dump = a.get("--dump-views");
     std::vector<Image> imgs(I);
-    std::atomic<int> bad_imgs{0};
+    std::atomic<int> bad_imgs{0}, colour_imgs{0};
     {
       Counter cnt("features", I);
       parallel_for(I, P.threads, [&](int i) {
         Image &im = imgs[i];
         im.kf = i / C;
         im.cam = i % C;
-        const cv::Mat g = cv::imread(kfs[im.kf].files[im.cam], cv::IMREAD_GRAYSCALE);
+        // one decode for an 8-bit grey image; a colour one is decoded again as grey, so the features are
+        // the same as ever (libjpeg's grey decode is not cvtColor of its colour one)
+        const std::string &file = kfs[im.kf].files[im.cam];
+        const cv::Mat src = cv::imread(file, cv::IMREAD_UNCHANGED);
+        const bool colour = src.type() == CV_8UC3;
+        const cv::Mat g = src.type() == CV_8UC1 ? src : cv::imread(file, cv::IMREAD_GRAYSCALE);
         if (g.empty() || g.cols != cams[im.cam].width || g.rows != cams[im.cam].height) {
           bad_imgs++;
         } else {
@@ -449,9 +456,16 @@ int main(int argc, char **argv) {
             return;
           }
           orb.extract(v, views[im.cam].mask, im.kps, im.desc);
-          for (const auto &k : im.kps)
-            im.grey.push_back(v.at<uint8_t>(std::min(v.rows - 1, std::max(0, (int)std::lround(k.pt.y))),
-                                            std::min(v.cols - 1, std::max(0, (int)std::lround(k.pt.x)))));
+          const cv::Mat vc = colour ? views[im.cam].render(src) : cv::Mat();
+          for (const auto &k : im.kps) {
+            const int y = std::min(v.rows - 1, std::max(0, (int)std::lround(k.pt.y)));
+            const int x = std::min(v.cols - 1, std::max(0, (int)std::lround(k.pt.x)));
+            im.grey.push_back(v.at<uint8_t>(y, x));
+            if (colour)
+              im.bgr.push_back(vc.at<cv::Vec3b>(y, x));
+          }
+          if (colour)
+            colour_imgs++;
           if (P.thumb_size > 0) {
             cv::Mat th;
             cv::resize(v, th, cv::Size(P.thumb_size, P.thumb_size), 0, 0, cv::INTER_AREA);
@@ -1291,12 +1305,21 @@ int main(int argc, char **argv) {
       std::ofstream f(prev);
       const size_t stride = std::max<size_t>(1, (m.points_xyz.size() + 149999) / 150000); // the page draws ~150k points well
       f << "{\"stride\": " << stride << ", \"points\": [";
+      const bool colour = colour_imgs == I; // every keyframe image colour: r g b after grey
       for (size_t i = 0; i < m.points_xyz.size(); i += stride) {
-        double g = 0;
-        for (const auto &o : tracks[i].obs)
+        double g = 0, bgr[3] = {0, 0, 0};
+        for (const auto &o : tracks[i].obs) {
           g += imgs[o.first].grey[o.second];
+          if (colour)
+            for (int ch = 0; ch < 3; ch++)
+              bgr[ch] += imgs[o.first].bgr[o.second][ch];
+        }
+        const double n = tracks[i].obs.size();
         f << (i ? "," : "") << "[" << jnum(m.points_xyz[i].x(), 3) << "," << jnum(m.points_xyz[i].y(), 3) << "," << jnum(m.points_xyz[i].z(), 3)
-          << "," << (int)std::lround(g / tracks[i].obs.size()) << "]";
+          << "," << (int)std::lround(g / n);
+        if (colour)
+          f << "," << (int)std::lround(bgr[2] / n) << "," << (int)std::lround(bgr[1] / n) << "," << (int)std::lround(bgr[0] / n);
+        f << "]";
       }
       f << "], \"keyframes\": [";
       for (int k = 0; k < K; k++) {
