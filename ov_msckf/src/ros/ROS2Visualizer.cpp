@@ -562,35 +562,46 @@ void ROS2Visualizer::callback_ring(const sensor_msgs::msg::Image::SharedPtr msg0
   }
 
   // All cameras of one frame are stamped with the same trigger edge, but each
-  // converts it with its own clock read, so the stamps differ by up to ~1 us
-  // (RK3588_SLAM board: median 0.3 us, max 0.7 us) and an exact or us-rounded
-  // key splits about a quarter of the frames. Join a frame within ring_tol.
-  const double ring_tol = 1e-3;
+  // converts it with its own clock read: equal to ~1 us on the RK3588_SLAM
+  // board (median 0.3 us, max 0.7 us), so an exact or us-rounded key splits
+  // about a quarter of the frames; in stretches of 2026-10-19's bags 1-7 ms
+  // apart, with no camera nearer the others than the rest, and a 1 ms
+  // tolerance dropped all the frames of 10-50 s at a time (the IMU alone then
+  // carried the state off: 34 m/s by the end of one run). Join a frame within
+  // ring_tol of its first image -- under half the 33 ms frame interval, so
+  // never the next trigger's -- and stamp it with the median of its images'
+  // stamps, as ring_config/triggers.py groups the images downstream.
+  const double ring_tol = 10e-3;
   std::lock_guard<std::mutex> lck(ring_mtx);
+  double key = timestamp;
   auto frame = ring_buffer.lower_bound(timestamp - ring_tol);
   if (frame != ring_buffer.end() && frame->first <= timestamp + ring_tol) {
-    timestamp = frame->first;
+    key = frame->first;
   } else if (ring_last_timestamp >= 0 && timestamp < ring_last_timestamp + 1.0 / _app->get_params().track_frequency) {
     return;
   }
-  ring_buffer[timestamp][cam_id0] = cv_ptr->image.clone();
-  if ((int)ring_buffer[timestamp].size() < N)
+  ring_buffer[key][cam_id0] = {timestamp, cv_ptr->image.clone()};
+  if ((int)ring_buffer[key].size() < N)
     return;
 
+  std::vector<double> stamps;
+  for (const auto &img : ring_buffer[key])
+    stamps.push_back(img.second.first);
+  std::sort(stamps.begin(), stamps.end());
   ov_core::CameraData message;
-  message.timestamp = timestamp;
+  message.timestamp = N % 2 ? stamps[N / 2] : (stamps[N / 2 - 1] + stamps[N / 2]) / 2;
   for (int i = 0; i < N; i++) {
     message.sensor_ids.push_back(i);
-    message.images.push_back(ring_buffer[timestamp].at(i));
+    message.images.push_back(ring_buffer[key].at(i).second);
     if (_app->get_params().use_mask) {
       message.masks.push_back(_app->get_params().masks.at(i));
     } else {
       message.masks.push_back(cv::Mat::zeros(message.images.back().rows, message.images.back().cols, CV_8UC1));
     }
   }
-  ring_last_timestamp = timestamp;
+  ring_last_timestamp = message.timestamp;
   for (auto it = ring_buffer.begin(); it != ring_buffer.end();) {
-    if (it->first <= timestamp)
+    if (it->first <= key)
       it = ring_buffer.erase(it);
     else
       ++it;

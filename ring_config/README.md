@@ -3,8 +3,9 @@
 The open_vins configuration of the RK3588_SLAM fisheye ring, generated from a
 Kalibr camera-IMU calibration (`camchain-imucam.yaml`): `openvins_config.py`
 (cameras, order, masks, noise; `python3 openvins_config.py --help`), the
-estimator template it fills in, `openvins_estimator_template.yaml`, and the
-Kalibr yaml reader it uses, `kalibr.py`.
+estimator template it fills in, `openvins_estimator_template.yaml`, the
+Kalibr yaml reader it uses, `kalibr.py`, and `triggers.py`, which groups a
+bag's images by trigger as open_vins' `callback_ring` assembles its frames.
 
 One copy for both users, so that the board and the compute server run the
 same VIO on the same data:
