@@ -70,6 +70,13 @@ ROS1Visualizer::ROS1Visualizer(std::shared_ptr<ros::NodeHandle> nh, std::shared_
     if (!of_tokens.is_open())
       PRINT_ERROR(RED "unable to open tokens_out %s\n" RESET, tokens_out.c_str());
   }
+  std::string tokens_q_out;
+  nh->param<std::string>("tokens_q_out", tokens_q_out, "");
+  if (!tokens_q_out.empty()) {
+    of_tokens_q.open(tokens_q_out, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!of_tokens_q.is_open())
+      PRINT_ERROR(RED "unable to open tokens_q_out %s\n" RESET, tokens_q_out.c_str());
+  }
   pub_points_aruco = nh->advertise<sensor_msgs::PointCloud2>("points_aruco", 2);
   PRINT_DEBUG("Publishing: %s\n", pub_points_aruco.getTopic().c_str());
   pub_points_sim = nh->advertise<sensor_msgs::PointCloud2>("points_sim", 2);
@@ -838,6 +845,15 @@ void ROS1Visualizer::publish_feature_tokens() {
       of_tokens.write((const char *)row, sizeof(row));
     }
     of_tokens.flush();
+    if (of_tokens_q.is_open()) {        // same header and count, then n x [sigma_r parallax reproj chi2r]
+      of_tokens_q.write((const char *)head, sizeof(head));
+      of_tokens_q.write((const char *)&n, sizeof(n));
+      for (auto const &tok : toks) {
+        double q[4] = {(double)tok.sigma_r, (double)tok.parallax, (double)tok.reproj, (double)tok.chi2r};
+        of_tokens_q.write((const char *)q, sizeof(q));
+      }
+      of_tokens_q.flush();
+    }
   }
 }
 

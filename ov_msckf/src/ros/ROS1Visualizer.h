@@ -230,6 +230,7 @@ protected:
   // (binary, little endian, per update: double t, p_IinG[3], R_GtoI[9] row-major, int32 n, then n x 9 doubles
   // x y z kind track_len n_obs cams first_t id)
   std::ofstream of_tokens;
+  std::ofstream of_tokens_q;   ///< per-row token quality (sigma_r parallax reproj chi2r), aligned with of_tokens
 
   /// The tokens of the current state: feat_tokens topic (when subscribed) and the tokens_out file
   void publish_feature_tokens();
