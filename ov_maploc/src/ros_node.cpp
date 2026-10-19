@@ -151,12 +151,26 @@ private:
   };
 
   void on_image(int i, const ImageMsg &m) {
-    const double s = stamp_s(m->header.stamp);
+    double s = stamp_s(m->header.stamp);
+    // The cameras of one frame share a trigger edge, not always a stamp: each
+    // driver converts the edge with its own clock read (~1 us apart), and with
+    // stamp_mid_exposure (AR0234, AE per camera) each is stamped at its own
+    // mid-exposure, up to 8 ms apart. Join within 10 ms (half a 30 Hz period is
+    // 16.7) and stamp the frame with its cameras' median, as OpenVINS's
+    // callback_ring does, so that a VIO pose (that stamp + td) finds it.
+    auto near = pending_.lower_bound(s - 10e-3);
+    if (near != pending_.end() && near->first <= s + 10e-3)
+      s = near->first;
     auto &slot = pending_[s];
     slot.resize(n_cams_);
     slot[i] = m;
     if (std::all_of(slot.begin(), slot.end(), [](const ImageMsg &x) { return (bool)x; })) {
-      frames_.push_back({s, slot});
+      std::vector<double> st;
+      for (const ImageMsg &x : slot)
+        st.push_back(stamp_s(x->header.stamp));
+      std::sort(st.begin(), st.end());
+      const size_t h = st.size() / 2;
+      frames_.push_back({st.size() % 2 ? st[h] : (st[h - 1] + st[h]) / 2, slot});
       if (frames_.size() > 8)
         frames_.pop_front();
       for (auto it = pending_.begin(); it != pending_.end() && it->first <= s;)
