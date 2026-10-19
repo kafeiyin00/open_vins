@@ -197,9 +197,9 @@ protected:
   /// Triangulated features with track statistics (SLAM + last-update MSCKF), for learned consumers
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_feat_tokens;
 
-  // Ring stereo: per-stamp collection of the N camera images
+  // Ring stereo: the N camera images of one trigger, keyed by the stamp of the first to arrive: camera -> (its stamp, image)
   std::mutex ring_mtx;
-  std::map<double, std::map<int, cv::Mat>> ring_buffer;
+  std::map<double, std::map<int, std::pair<double, cv::Mat>>> ring_buffer;
   double ring_last_timestamp = -1.0;
 
   // Last timestamp we visualized at

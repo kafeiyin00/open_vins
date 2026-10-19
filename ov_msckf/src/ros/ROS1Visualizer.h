@@ -203,9 +203,9 @@ protected:
   // Publish the IMU-rate odometry (visualize_odometry)
   bool odometry = true;
 
-  // Ring stereo: per-stamp collection of the N camera images
+  // Ring stereo: the N camera images of one trigger, keyed by the stamp of the first to arrive: camera -> (its stamp, image)
   std::mutex ring_mtx;
-  std::map<double, std::map<int, cv::Mat>> ring_buffer;
+  std::map<double, std::map<int, std::pair<double, cv::Mat>>> ring_buffer;
   double ring_last_timestamp = -1.0;
 
   // Last timestamp we visualized at
