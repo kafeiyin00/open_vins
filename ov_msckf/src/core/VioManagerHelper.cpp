@@ -26,6 +26,7 @@
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
+#include "types/Landmark.h"
 #include "types/LandmarkRepresentation.h"
 #include "utils/print.h"
 
@@ -437,6 +438,10 @@ void VioManager::fill_token_stats(FeatToken &tok, const std::shared_ptr<ov_core:
     tok.cams = cams;
     tok.first_t = tmin;
   }
+  tok.sigma_r = feat->q_sigma_r;
+  tok.parallax = feat->q_parallax;
+  tok.reproj = feat->q_reproj;
+  tok.chi2r = feat->q_chi2r;
 }
 
 std::vector<VioManager::FeatToken> VioManager::get_feature_tokens_SLAM() {
@@ -459,6 +464,33 @@ std::vector<VioManager::FeatToken> VioManager::get_feature_tokens_SLAM() {
       tok.p_FinG = f.second->get_xyz(false);
     }
     fill_token_stats(tok, db->get_feature(f.first));
+    // Range sigma from the state covariance of the landmark: numerical Jacobian of its position (anchor frame for the
+    // relative representations, global otherwise) w.r.t. its parameters, projected on the ray from the anchor camera
+    // (relative) or from the current IMU position (global); the anchor pose's own uncertainty is ignored
+    {
+      std::vector<std::shared_ptr<ov_type::Type>> order = {f.second};
+      Eigen::MatrixXd P = StateHelper::get_marginal_covariance(state, order);
+      auto lm = std::make_shared<ov_type::Landmark>(f.second->size());   // a copy (Vec::clone() returns a plain Vec)
+      lm->_feat_representation = f.second->_feat_representation;
+      lm->set_value(f.second->value());
+      if (P.rows() == lm->size()) {
+        Eigen::VectorXd x0 = lm->value();
+        Eigen::Vector3d p0 = lm->get_xyz(false);
+        Eigen::MatrixXd J(3, x0.size());
+        for (int k = 0; k < x0.size(); k++) {
+          double h = 1e-6 * std::max(1.0, std::abs(x0(k)));
+          Eigen::VectorXd x = x0;
+          x(k) += h;
+          lm->set_value(x);
+          J.col(k) = (lm->get_xyz(false) - p0) / h;
+        }
+        Eigen::Vector3d u = ov_type::LandmarkRepresentation::is_relative_representation(f.second->_feat_representation)
+                                ? p0.normalized()
+                                : (p0 - state->_imu->pos()).normalized();
+        double var_r = u.dot(J * P * J.transpose() * u);
+        tok.sigma_r = (float)std::sqrt(std::max(0.0, var_r));
+      }
+    }
     toks.push_back(tok);
   }
   return toks;

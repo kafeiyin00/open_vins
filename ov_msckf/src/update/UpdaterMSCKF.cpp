@@ -201,12 +201,49 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Get the Jacobian for this feature
     UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
+    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order);
+
+    // Token quality (before the nullspace projection, which removes the feature from the system): the covariance of
+    // the global position from the information H_f' (R + H_x P H_x')^-1 H_f, its range sigma along the ray from the
+    // newest camera, the largest parallax between observation rays and the RMS reprojection residual
+    if (feat.feat_representation == LandmarkRepresentation::Representation::GLOBAL_3D && H_f.cols() == 3 && res.rows() >= 4) {
+      Eigen::MatrixXd Sm = H_x * P_marg * H_x.transpose();
+      Sm.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(Sm.rows());
+      Eigen::LLT<Eigen::MatrixXd> llt(Sm);
+      Eigen::Matrix3d info = H_f.transpose() * llt.solve(H_f);
+      Eigen::Vector3d p_newest = Eigen::Vector3d::Zero(), ray_first = Eigen::Vector3d::Zero();
+      double t_newest = -1;
+      double max_ang = 0;
+      std::vector<Eigen::Vector3d> rays;
+      for (const auto &pair : feat.timestamps) {
+        for (double t : pair.second) {
+          if (clones_cam.at(pair.first).find(t) == clones_cam.at(pair.first).end())
+            continue;
+          Eigen::Vector3d c = clones_cam.at(pair.first).at(t).pos();
+          rays.push_back((feat.p_FinG - c).normalized());
+          if (t > t_newest) {
+            t_newest = t;
+            p_newest = c;
+          }
+        }
+      }
+      for (size_t a = 0; a < rays.size(); a++)
+        for (size_t b = a + 1; b < rays.size(); b++)
+          max_ang = std::max(max_ang, std::acos(std::min(1.0, std::max(-1.0, rays[a].dot(rays[b])))));
+      Eigen::FullPivLU<Eigen::Matrix3d> lu(info);
+      if (lu.isInvertible() && t_newest > 0) {
+        Eigen::Vector3d u = (feat.p_FinG - p_newest).normalized();
+        double var_r = u.dot(lu.solve(u));
+        (*it2)->q_sigma_r = (float)std::sqrt(std::max(0.0, var_r));
+      }
+      (*it2)->q_parallax = (float)max_ang;
+      (*it2)->q_reproj = (float)std::sqrt(res.squaredNorm() / (0.5 * res.rows()));
+    }
 
     // Nullspace project
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
     /// Chi2 distance check
-    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order);
     Eigen::MatrixXd S = H_x * P_marg * H_x.transpose();
     S.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
     double chi2 = res.dot(S.llt().solve(res));
@@ -222,6 +259,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Check if we should delete or not
+    (*it2)->q_chi2r = (float)(chi2 / (_options.chi2_multipler * chi2_check));
     if (chi2 > _options.chi2_multipler * chi2_check) {
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);

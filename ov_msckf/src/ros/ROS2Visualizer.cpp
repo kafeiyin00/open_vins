@@ -741,7 +741,7 @@ void ROS2Visualizer::publish_features() {
 
   // Check if we have subscribers
   // Feature tokens: SLAM features in the state + MSCKF features of the last
-  // update, each with [x y z kind track_len n_obs cams first_t id]. Stamped
+  // update, each with [x y z kind track_len n_obs cams first_t id sigma_r parallax reproj chi2r]. Stamped
   // with the STATE time so a bag consumer can pair them with the images.
   if (pub_feat_tokens->get_subscription_count() > 0) {
     std::vector<VioManager::FeatToken> toks = _app->get_feature_tokens_SLAM();
@@ -755,15 +755,18 @@ void ROS2Visualizer::publish_features() {
     cloud.is_bigendian = false;
     cloud.is_dense = true;
     sensor_msgs::PointCloud2Modifier mod(cloud);
-    mod.setPointCloud2Fields(9, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1, sensor_msgs::msg::PointField::FLOAT32, "z", 1,
+    mod.setPointCloud2Fields(13, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1, sensor_msgs::msg::PointField::FLOAT32, "z", 1,
                              sensor_msgs::msg::PointField::FLOAT32, "kind", 1, sensor_msgs::msg::PointField::FLOAT32, "track_len", 1,
                              sensor_msgs::msg::PointField::FLOAT32, "n_obs", 1, sensor_msgs::msg::PointField::FLOAT32, "cams", 1,
                              sensor_msgs::msg::PointField::FLOAT32, "first_t", 1, sensor_msgs::msg::PointField::FLOAT64, "id", 1,
-                             sensor_msgs::msg::PointField::FLOAT64);
+                             sensor_msgs::msg::PointField::FLOAT64, "sigma_r", 1, sensor_msgs::msg::PointField::FLOAT32, "parallax", 1,
+                             sensor_msgs::msg::PointField::FLOAT32, "reproj", 1, sensor_msgs::msg::PointField::FLOAT32, "chi2r", 1,
+                             sensor_msgs::msg::PointField::FLOAT32);
     mod.resize(toks.size());
     sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x"), iy(cloud, "y"), iz(cloud, "z"), ik(cloud, "kind"), it(cloud, "track_len"),
         in(cloud, "n_obs"), ic(cloud, "cams");
     sensor_msgs::PointCloud2Iterator<double> ift(cloud, "first_t"), iid(cloud, "id");
+    sensor_msgs::PointCloud2Iterator<float> isr(cloud, "sigma_r"), ipa(cloud, "parallax"), irp(cloud, "reproj"), ich(cloud, "chi2r");
     for (auto const &tok : toks) {
       *ix = (float)tok.p_FinG(0);
       *iy = (float)tok.p_FinG(1);
@@ -774,7 +777,11 @@ void ROS2Visualizer::publish_features() {
       *ic = (float)tok.cams;
       *ift = tok.first_t;
       *iid = (double)tok.id;
-      ++ix; ++iy; ++iz; ++ik; ++it; ++in; ++ic; ++ift; ++iid;
+      *isr = tok.sigma_r;
+      *ipa = tok.parallax;
+      *irp = tok.reproj;
+      *ich = tok.chi2r;
+      ++ix; ++iy; ++iz; ++ik; ++it; ++in; ++ic; ++ift; ++iid; ++isr; ++ipa; ++irp; ++ich;
     }
     pub_feat_tokens->publish(cloud);
   }

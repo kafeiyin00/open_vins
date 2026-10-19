@@ -137,6 +137,10 @@ public:
     int cams = 0;           ///< bitmask of camera ids that observed it
     double first_t = -1;    ///< first observation time
     int kind = 0;           ///< 0 = SLAM (in state), 1 = MSCKF (used in the last update)
+    float sigma_r = -1;     ///< 1-sigma range uncertainty along the viewing ray (m), -1 if unknown
+    float parallax = -1;    ///< largest angle between the observation rays of the last triangulation (rad), MSCKF only
+    float reproj = -1;      ///< RMS reprojection residual of the last triangulation (px), MSCKF only
+    float chi2r = -1;       ///< chi2 of the MSCKF update test / its threshold, MSCKF only
   };
 
   /// MSCKF features used in the last update, with track statistics

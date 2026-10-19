@@ -66,6 +66,12 @@ public:
   /// Triangulated position of this feature, in the global frame
   Eigen::Vector3d p_FinG;
 
+  /// Geometric quality of the last MSCKF triangulation (landmark tokens), -1 if unknown:
+  /// 1-sigma uncertainty of the range along the ray from the newest clone (m), from the triangulation information
+  /// with the clone covariance; largest angle between the observation rays (rad); RMS reprojection residual (px);
+  /// chi2 of the update test divided by its threshold (< 1 passed)
+  float q_sigma_r = -1, q_parallax = -1, q_reproj = -1, q_chi2r = -1;
+
   /**
    * @brief Remove measurements that do not occur at passed timestamps.
    *
