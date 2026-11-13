@@ -292,7 +292,11 @@ struct VioManagerOptions {
           }
           cv::Mat mask = cv::imread(total_mask_path, cv::IMREAD_GRAYSCALE);
           masks.insert({i, mask});
-          if (mask.cols != camera_intrinsics.at(i)->w() || mask.rows != camera_intrinsics.at(i)->h()) {
+          // The mask is halved together with each image (VioManager::feed_measurement_camera), so with
+          // downsample_cameras the file is full size while the intrinsics above are already halved.
+          int mask_w = downsample_cameras ? mask.cols / 2 : mask.cols;
+          int mask_h = downsample_cameras ? mask.rows / 2 : mask.rows;
+          if (mask_w != camera_intrinsics.at(i)->w() || mask_h != camera_intrinsics.at(i)->h()) {
             PRINT_ERROR(RED "VioManager(): mask size does not match camera!\n" RESET);
             PRINT_ERROR(RED "\t- mask%d - %s\n" RESET, i, total_mask_path.c_str());
             PRINT_ERROR(RED "\t- mask%d - %d x %d\n" RESET, mask.cols, mask.rows);

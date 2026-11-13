@@ -216,9 +216,11 @@ imu0:
         'use_stereo': (('true', 'ring stereo, cam i paired with cam i+1 (cameras are in ring order)') if stereo == 'ring'
                        else ('false', 'every camera tracked on its own (monocular)')),
         'max_cameras': (str(ncam), None),
-        'calib_cam_extrinsics': ('true', None),
+        # online camera-IMU calibration off (user, 2026-10-17): with the official AR0234 calibration it made open_vins
+        # diverge on the 2026-10-14 18-56-18 bag every time (path 753 m), and with few features it pulls the extrinsics off
+        'calib_cam_extrinsics': ('false', 'the Kalibr camera-IMU calibration as it is'),
         'calib_cam_intrinsics': ('false', 'trust the Kalibr intrinsics (else 8 more states per camera)'),
-        'calib_cam_timeoffset': ('true', 'one offset for all cameras, they share a trigger (no colon in comments, OpenCV YAML misreads it)'),
+        'calib_cam_timeoffset': ('false', 'the Kalibr time offset as it is (no colon in comments, OpenCV YAML misreads it)'),
         'gravity_mag': (f'{gravity}', None),
         # open_vins drops a frame arriving sooner than 1/track_frequency after
         # the last one, and trigger-grid intervals of exactly 1/rate round either way

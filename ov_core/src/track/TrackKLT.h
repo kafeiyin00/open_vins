@@ -24,6 +24,8 @@
 
 #include "TrackBase.h"
 
+#include <unordered_map>
+
 namespace ov_core {
 
 /**
@@ -133,7 +135,8 @@ protected:
    */
   void perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, const cv::Mat &mask0,
                               const cv::Mat &mask1, size_t cam_id_left, size_t cam_id_right, std::vector<cv::KeyPoint> &pts0,
-                              std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1);
+                              std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1,
+                              const std::vector<cv::Mat> *warped_pyr = nullptr);
 
   /**
    * @brief KLT track between two images, and do RANSAC afterwards
@@ -157,6 +160,33 @@ protected:
   // baseline is < 13 deg) and if the backward track returns within this many px.
   double ring_max_angle_deg = 15.0;
   double ring_fb_px = 2.0;
+
+  // Ring stereo cost (2026-10-16, the board: 35 of 44 ms tracking went to the pair detection, which added
+  // ~0 features a frame and kept ~3 seen by two cameras). Read from the environment on the first ring frame:
+  //   OV_RING_PARALLEL_WARP (1)  render every pair's left image in its right camera and build that pyramid for
+  //                              all pairs at once, before the (sequential) pair loop -- same result, less wall time
+  //   OV_RING_RETRY_FRAMES (0)   an existing track that failed to match into the right camera is tried again only
+  //                              after this many frames (0 = every frame, as before)
+  //   OV_RING_RIGHT_FAST (1)     top up the right camera with mono features in each pair; 0 leaves that to the pair
+  //                              where the camera is the left one, which extracts in it anyway
+  //   OV_RING_PYR_LEVELS (3)     highest pyramid level of the cross-camera KLT: 3 = four levels. The left image
+  //                              rendered in the right camera is black outside the overlap (57 % of the frame on
+  //                              the 4-camera ring), so with the temporal tracker's pyr_levels (5: 1/32 scale, a
+  //                              15 px window spans the image) the coarse levels pull the flow away and the
+  //                              forward-backward check rejects nearly every candidate, even one seeded at its
+  //                              true location. 2026-11-14, two bags of the board, 4 serial runs each: features
+  //                              seen by two cameras 0.6-1.2 -> 14-15 a frame; start-end distance on the harder
+  //                              bag 0.28 / 0.28 / 0.28 / 1.02 m against 0.30 / 3.53 / 3.53 m and one divergence;
+  //                              no more time. OV_RING_PYR_LEVELS=5 is the behaviour before that day.
+  int ring_parallel_warp = -1, ring_retry_frames = 0, ring_right_fast = 1, ring_pyr_levels = -1;
+  long ring_frame = 0;
+  std::map<std::pair<size_t, size_t>, std::unordered_map<size_t, long>> ring_retry;
+  // per-frame stage times of the pair detection (s) and the running summary logged every 5 s
+  double ring_t_fast0 = 0, ring_t_warp = 0, ring_t_klt = 0, ring_t_fast1 = 0;
+  struct RingStats {
+    int frames = 0;
+    double features = 0, shared = 0, detected = 0, t_det = 0, t_fast0 = 0, t_warp = 0, t_klt = 0, t_fast1 = 0, t0 = -1;
+  } ring_stats;
 
   /// Ring stereo: per pair, remap tables that render the LEFT image in the RIGHT camera's projection (far-point assumption)
   std::map<std::pair<size_t, size_t>, std::pair<cv::Mat, cv::Mat>> ring_maps;
