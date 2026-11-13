@@ -1058,19 +1058,21 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
           const auto &maps = get_ring_map(cam_id_left, cam_id_right, img1pyr.at(0).rows, img1pyr.at(0).cols);
           cv::Mat warped;
           cv::remap(img0pyr.at(0), warped, maps.first, maps.second, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
-          cv::buildOpticalFlowPyramid(warped, srcpyr, win_size, pyr_levels);
+          cv::buildOpticalFlowPyramid(warped, srcpyr, win_size, ring_pyr_levels >= 0 ? ring_pyr_levels : pyr_levels);
         } else {
           srcpyr = img0pyr;
         }
+        // the rendered left image has content in the overlap only: see ring_pyr_levels
+        int klt_levels = (have_rot && ring_pyr_levels >= 0) ? ring_pyr_levels : pyr_levels;
         boost::posix_time::ptime tw1 = now();
         ring_t_warp += secs(tw0, tw1);
         std::vector<uchar> st_f, st_b;
         std::vector<float> err_f, err_b;
         cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
-        cv::calcOpticalFlowPyrLK(srcpyr, img1pyr, src_pts, dst_pts, st_f, err_f, win_size, pyr_levels, term_crit,
+        cv::calcOpticalFlowPyrLK(srcpyr, img1pyr, src_pts, dst_pts, st_f, err_f, win_size, klt_levels, term_crit,
                                  cv::OPTFLOW_USE_INITIAL_FLOW);
         std::vector<cv::Point2f> back_pts = src_pts;
-        cv::calcOpticalFlowPyrLK(img1pyr, srcpyr, dst_pts, back_pts, st_b, err_b, win_size, pyr_levels, term_crit,
+        cv::calcOpticalFlowPyrLK(img1pyr, srcpyr, dst_pts, back_pts, st_b, err_b, win_size, klt_levels, term_crit,
                                  cv::OPTFLOW_USE_INITIAL_FLOW);
         ring_t_klt += secs(tw1, now());
         double cos_max = std::cos(ring_max_angle_deg * M_PI / 180.0);
@@ -1354,8 +1356,10 @@ void TrackKLT::feed_ring(const CameraData &message) {
     ring_parallel_warp = env("OV_RING_PARALLEL_WARP", 1);
     ring_retry_frames = std::max(0, env("OV_RING_RETRY_FRAMES", 0));
     ring_right_fast = env("OV_RING_RIGHT_FAST", 1);
-    PRINT_INFO("[RING]: parallel warp %d, retry a failed cross-camera match after %d frames, right-image top-up %d\n",
-               ring_parallel_warp, ring_retry_frames, ring_right_fast);
+    ring_pyr_levels = std::min(pyr_levels, std::max(0, env("OV_RING_PYR_LEVELS", 3)));
+    PRINT_INFO("[RING]: parallel warp %d, retry a failed cross-camera match after %d frames, right-image top-up %d, "
+               "cross-camera KLT up to pyramid level %d (temporal %d)\n",
+               ring_parallel_warp, ring_retry_frames, ring_right_fast, ring_pyr_levels, pyr_levels);
   }
   ring_frame++;
   ring_t_fast0 = ring_t_warp = ring_t_klt = ring_t_fast1 = 0;
@@ -1421,7 +1425,7 @@ void TrackKLT::feed_ring(const CameraData &message) {
                       cv::Mat w;
                       cv::remap(img_pyramid_last[L].at(0), w, maps.first, maps.second, cv::INTER_LINEAR, cv::BORDER_CONSTANT,
                                 cv::Scalar(0));
-                      cv::buildOpticalFlowPyramid(w, warped[k], win_size, pyr_levels);
+                      cv::buildOpticalFlowPyramid(w, warped[k], win_size, ring_pyr_levels);
                     }
                   }));
     ring_t_warp += (boost::posix_time::microsec_clock::local_time() - tw0).total_microseconds() * 1e-6;

@@ -169,7 +169,16 @@ protected:
   //                              after this many frames (0 = every frame, as before)
   //   OV_RING_RIGHT_FAST (1)     top up the right camera with mono features in each pair; 0 leaves that to the pair
   //                              where the camera is the left one, which extracts in it anyway
-  int ring_parallel_warp = -1, ring_retry_frames = 0, ring_right_fast = 1;
+  //   OV_RING_PYR_LEVELS (3)     highest pyramid level of the cross-camera KLT: 3 = four levels. The left image
+  //                              rendered in the right camera is black outside the overlap (57 % of the frame on
+  //                              the 4-camera ring), so with the temporal tracker's pyr_levels (5: 1/32 scale, a
+  //                              15 px window spans the image) the coarse levels pull the flow away and the
+  //                              forward-backward check rejects nearly every candidate, even one seeded at its
+  //                              true location. 2026-11-14, two bags of the board, 4 serial runs each: features
+  //                              seen by two cameras 0.6-1.2 -> 14-15 a frame; start-end distance on the harder
+  //                              bag 0.28 / 0.28 / 0.28 / 1.02 m against 0.30 / 3.53 / 3.53 m and one divergence;
+  //                              no more time. OV_RING_PYR_LEVELS=5 is the behaviour before that day.
+  int ring_parallel_warp = -1, ring_retry_frames = 0, ring_right_fast = 1, ring_pyr_levels = -1;
   long ring_frame = 0;
   std::map<std::pair<size_t, size_t>, std::unordered_map<size_t, long>> ring_retry;
   // per-frame stage times of the pair detection (s) and the running summary logged every 5 s
