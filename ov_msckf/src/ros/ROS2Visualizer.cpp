@@ -562,35 +562,46 @@ void ROS2Visualizer::callback_ring(const sensor_msgs::msg::Image::SharedPtr msg0
   }
 
   // All cameras of one frame are stamped with the same trigger edge, but each
-  // converts it with its own clock read, so the stamps differ by up to ~1 us
-  // (RK3588_SLAM board: median 0.3 us, max 0.7 us) and an exact or us-rounded
-  // key splits about a quarter of the frames. Join a frame within ring_tol.
-  const double ring_tol = 1e-3;
+  // converts it with its own clock read: equal to ~1 us on the RK3588_SLAM
+  // board (median 0.3 us, max 0.7 us), so an exact or us-rounded key splits
+  // about a quarter of the frames; in stretches of 2026-10-19's bags 1-7 ms
+  // apart, with no camera nearer the others than the rest, and a 1 ms
+  // tolerance dropped all the frames of 10-50 s at a time (the IMU alone then
+  // carried the state off: 34 m/s by the end of one run). Join a frame within
+  // ring_tol of its first image -- under half the 33 ms frame interval, so
+  // never the next trigger's -- and stamp it with the median of its images'
+  // stamps, as ring_config/triggers.py groups the images downstream.
+  const double ring_tol = 10e-3;
   std::lock_guard<std::mutex> lck(ring_mtx);
+  double key = timestamp;
   auto frame = ring_buffer.lower_bound(timestamp - ring_tol);
   if (frame != ring_buffer.end() && frame->first <= timestamp + ring_tol) {
-    timestamp = frame->first;
+    key = frame->first;
   } else if (ring_last_timestamp >= 0 && timestamp < ring_last_timestamp + 1.0 / _app->get_params().track_frequency) {
     return;
   }
-  ring_buffer[timestamp][cam_id0] = cv_ptr->image.clone();
-  if ((int)ring_buffer[timestamp].size() < N)
+  ring_buffer[key][cam_id0] = {timestamp, cv_ptr->image.clone()};
+  if ((int)ring_buffer[key].size() < N)
     return;
 
+  std::vector<double> stamps;
+  for (const auto &img : ring_buffer[key])
+    stamps.push_back(img.second.first);
+  std::sort(stamps.begin(), stamps.end());
   ov_core::CameraData message;
-  message.timestamp = timestamp;
+  message.timestamp = N % 2 ? stamps[N / 2] : (stamps[N / 2 - 1] + stamps[N / 2]) / 2;
   for (int i = 0; i < N; i++) {
     message.sensor_ids.push_back(i);
-    message.images.push_back(ring_buffer[timestamp].at(i));
+    message.images.push_back(ring_buffer[key].at(i).second);
     if (_app->get_params().use_mask) {
       message.masks.push_back(_app->get_params().masks.at(i));
     } else {
       message.masks.push_back(cv::Mat::zeros(message.images.back().rows, message.images.back().cols, CV_8UC1));
     }
   }
-  ring_last_timestamp = timestamp;
+  ring_last_timestamp = message.timestamp;
   for (auto it = ring_buffer.begin(); it != ring_buffer.end();) {
-    if (it->first <= timestamp)
+    if (it->first <= key)
       it = ring_buffer.erase(it);
     else
       ++it;
@@ -741,7 +752,7 @@ void ROS2Visualizer::publish_features() {
 
   // Check if we have subscribers
   // Feature tokens: SLAM features in the state + MSCKF features of the last
-  // update, each with [x y z kind track_len n_obs cams first_t id]. Stamped
+  // update, each with [x y z kind track_len n_obs cams first_t id sigma_r parallax reproj chi2r]. Stamped
   // with the STATE time so a bag consumer can pair them with the images.
   if (pub_feat_tokens->get_subscription_count() > 0) {
     std::vector<VioManager::FeatToken> toks = _app->get_feature_tokens_SLAM();
@@ -755,15 +766,18 @@ void ROS2Visualizer::publish_features() {
     cloud.is_bigendian = false;
     cloud.is_dense = true;
     sensor_msgs::PointCloud2Modifier mod(cloud);
-    mod.setPointCloud2Fields(9, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1, sensor_msgs::msg::PointField::FLOAT32, "z", 1,
+    mod.setPointCloud2Fields(13, "x", 1, sensor_msgs::msg::PointField::FLOAT32, "y", 1, sensor_msgs::msg::PointField::FLOAT32, "z", 1,
                              sensor_msgs::msg::PointField::FLOAT32, "kind", 1, sensor_msgs::msg::PointField::FLOAT32, "track_len", 1,
                              sensor_msgs::msg::PointField::FLOAT32, "n_obs", 1, sensor_msgs::msg::PointField::FLOAT32, "cams", 1,
                              sensor_msgs::msg::PointField::FLOAT32, "first_t", 1, sensor_msgs::msg::PointField::FLOAT64, "id", 1,
-                             sensor_msgs::msg::PointField::FLOAT64);
+                             sensor_msgs::msg::PointField::FLOAT64, "sigma_r", 1, sensor_msgs::msg::PointField::FLOAT32, "parallax", 1,
+                             sensor_msgs::msg::PointField::FLOAT32, "reproj", 1, sensor_msgs::msg::PointField::FLOAT32, "chi2r", 1,
+                             sensor_msgs::msg::PointField::FLOAT32);
     mod.resize(toks.size());
     sensor_msgs::PointCloud2Iterator<float> ix(cloud, "x"), iy(cloud, "y"), iz(cloud, "z"), ik(cloud, "kind"), it(cloud, "track_len"),
         in(cloud, "n_obs"), ic(cloud, "cams");
     sensor_msgs::PointCloud2Iterator<double> ift(cloud, "first_t"), iid(cloud, "id");
+    sensor_msgs::PointCloud2Iterator<float> isr(cloud, "sigma_r"), ipa(cloud, "parallax"), irp(cloud, "reproj"), ich(cloud, "chi2r");
     for (auto const &tok : toks) {
       *ix = (float)tok.p_FinG(0);
       *iy = (float)tok.p_FinG(1);
@@ -774,7 +788,11 @@ void ROS2Visualizer::publish_features() {
       *ic = (float)tok.cams;
       *ift = tok.first_t;
       *iid = (double)tok.id;
-      ++ix; ++iy; ++iz; ++ik; ++it; ++in; ++ic; ++ift; ++iid;
+      *isr = tok.sigma_r;
+      *ipa = tok.parallax;
+      *irp = tok.reproj;
+      *ich = tok.chi2r;
+      ++ix; ++iy; ++iz; ++ik; ++it; ++in; ++ic; ++ift; ++iid; ++isr; ++ipa; ++irp; ++ich;
     }
     pub_feat_tokens->publish(cloud);
   }

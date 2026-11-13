@@ -75,6 +75,7 @@ struct Img {
   sensor_msgs::ImageConstPtr raw;
   sensor_msgs::CompressedImageConstPtr jpg;
   explicit operator bool() const { return raw || jpg; }
+  const ros::Time &stamp() const { return raw ? raw->header.stamp : jpg->header.stamp; }
 };
 
 cv::Mat to_gray(const Img &m) {
@@ -204,17 +205,25 @@ private:
 
   void on_image(int i, const ros::Time &stamp, const Img &img) {
     double s = stamp_s(stamp);
-    // The cameras of one frame share a trigger edge, but each driver converts it
-    // with its own clock read: on the RK3588_SLAM board they differ by up to
-    // ~1 us, and an exact key splits about a quarter of the frames. Join within 1 ms.
-    auto near = pending_.lower_bound(s - 1e-3);
-    if (near != pending_.end() && near->first <= s + 1e-3)
+    // The cameras of one frame share a trigger edge, not always a stamp: each
+    // driver converts the edge with its own clock read (~1 us apart), and with
+    // stamp_mid_exposure (AR0234, AE per camera) each is stamped at its own
+    // mid-exposure, up to 8 ms apart. Join within 10 ms (half a 30 Hz period is
+    // 16.7) and stamp the frame with its cameras' median, as OpenVINS's
+    // callback_ring does, so that a VIO pose (that stamp + td) finds it.
+    auto near = pending_.lower_bound(s - 10e-3);
+    if (near != pending_.end() && near->first <= s + 10e-3)
       s = near->first;
     auto &slot = pending_[s];
     slot.resize(n_cams_);
     slot[i] = img;
     if (std::all_of(slot.begin(), slot.end(), [](const Img &x) { return (bool)x; })) {
-      frames_.push_back({s, slot});
+      std::vector<double> st;
+      for (const Img &x : slot)
+        st.push_back(stamp_s(x.stamp()));
+      std::sort(st.begin(), st.end());
+      const size_t h = st.size() / 2;
+      frames_.push_back({st.size() % 2 ? st[h] : (st[h - 1] + st[h]) / 2, slot});
       if (frames_.size() > 8)
         frames_.pop_front();
       for (auto it = pending_.begin(); it != pending_.end() && it->first <= s;)
