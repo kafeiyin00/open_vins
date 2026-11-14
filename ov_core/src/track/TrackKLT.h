@@ -25,6 +25,7 @@
 #include "TrackBase.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ov_core {
 
@@ -178,7 +179,23 @@ protected:
   //                              seen by two cameras 0.6-1.2 -> 14-15 a frame; start-end distance on the harder
   //                              bag 0.28 / 0.28 / 0.28 / 1.02 m against 0.30 / 3.53 / 3.53 m and one divergence;
   //                              no more time. OV_RING_PYR_LEVELS=5 is the behaviour before that day.
-  int ring_parallel_warp = -1, ring_retry_frames = 0, ring_right_fast = 1, ring_pyr_levels = -1;
+  //   OV_RING_DEPTH_SEEDS (0)    seeds for near objects. The search starts where the right camera sees a far
+  //                              point; on the 8 cm baseline something 0.44 m away is 60 px from there, out of
+  //                              the KLT's reach. With seeds, a candidate that did not match is tried again from
+  //                              where it would be at 25, 12.5, 7.5, 5, 3.75 and 2.75 baselines' depth, with
+  //                              three pyramid levels, and a match must lie in the epipolar plane (ring_epi_deg)
+  //                              in front of the camera instead of within ring_max_angle_deg. Needs
+  //                              set_pair_translations(). 0 never, 1 while the platform stands still
+  //                              (set_standstill(): the extra passes cost little then, and a track that fails
+  //                              waits 15 frames), 2 always. Off by default: on two simulated flights
+  //                              (2026-11-14, known truth) the seeds nearly doubled the landmarks a standstill
+  //                              gives (14 -> 25, 11 -> 21) at the same depth error (median 2-5 %), but the
+  //                              trajectory error went from 7.8 to 10.8 cm and from 5.7 to 6.5 cm over 19 m,
+  //                              and without them it stayed where it was (8.1 and 5.5 cm).
+  int ring_parallel_warp = -1, ring_retry_frames = 0, ring_right_fast = 1, ring_pyr_levels = -1, ring_depth_seeds = 0;
+  double ring_epi_deg = 1.5;
+  /// ids tracked in more than one camera this frame (feed_ring fills it, the pair detection adds its matches)
+  std::unordered_set<size_t> ring_multi_ids;
   long ring_frame = 0;
   std::map<std::pair<size_t, size_t>, std::unordered_map<size_t, long>> ring_retry;
   // per-frame stage times of the pair detection (s) and the running summary logged every 5 s

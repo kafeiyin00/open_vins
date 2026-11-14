@@ -27,6 +27,7 @@
 #include <atomic>
 #include <boost/filesystem.hpp>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,6 +44,9 @@ class FeatureInitializer;
 namespace ov_init {
 class InertialInitializer;
 } // namespace ov_init
+namespace ov_type {
+class Landmark;
+} // namespace ov_type
 
 namespace ov_msckf {
 
@@ -180,6 +184,22 @@ protected:
   void do_feature_propagate_update(const ov_core::CameraData &message);
 
   /**
+   * @brief Landmarks from the features two cameras see at once, while a zero velocity update holds the state.
+   *
+   * A zero velocity update returns before any visual update: no clone, no triangulation, so a still start has no
+   * 3d point until the first motion, and nothing but the IMU to hold on to at that moment. Features with
+   * observations in two cameras of the rig do not need motion: the cameras' baseline gives their depth. This
+   * clones the (still) pose at the current time, at most every zupt_stereo_period seconds and only when there are
+   * such features that are not landmarks yet, and hands them to the SLAM updater's delayed initialization (the
+   * same triangulation, chi2 test and covariance as for any other landmark). The clone window is kept as the
+   * main update keeps it. A feature that fails stays marked as used and is not tried again while standing.
+   */
+  void zupt_init_stereo_landmarks(const ov_core::CameraData &message);
+
+  /// A landmark of the state in the global frame (as get_features_SLAM() does for all of them)
+  Eigen::Vector3d landmark_in_global(const std::shared_ptr<ov_type::Landmark> &landmark);
+
+  /**
    * @brief This function will try to initialize the state.
    *
    * This should call on our initializer and try to init the state.
@@ -255,6 +275,12 @@ protected:
   bool did_zupt_update = false;
   bool has_moved_since_zupt = false;
   bool zupt_since_init = false; // a ZUPT has updated the state since initialization (see initialized())
+
+  // zupt_init_stereo_landmarks(): when the standstill began and the last attempt; what it initialized (id ->
+  // position then), to say after the first motion how many of them held and how far they moved
+  double zupt_stereo_first = -1, zupt_stereo_last = -1, zupt_stereo_moved = -1;
+  const double zupt_stereo_period = 0.5;
+  std::map<size_t, Eigen::Vector3d> zupt_stereo_init_pos;
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;

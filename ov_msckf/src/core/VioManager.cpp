@@ -145,14 +145,19 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // rotations to know where to look in the neighbour.
   if (params.use_stereo && params.state_options.num_cameras > 2) {
     std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> rots;
+    std::map<std::pair<size_t, size_t>, Eigen::Vector3d> trans;
     int N = params.state_options.num_cameras;
     for (int i = 0; i < N; i++) {
       int j = (i + 1) % N;
       Eigen::Matrix3d R_ItoCi = ov_core::quat_2_Rot(params.camera_extrinsics.at(i).block(0, 0, 4, 1));
       Eigen::Matrix3d R_ItoCj = ov_core::quat_2_Rot(params.camera_extrinsics.at(j).block(0, 0, 4, 1));
       rots[{(size_t)i, (size_t)j}] = R_ItoCj * R_ItoCi.transpose();
+      // camera i's centre in camera j: x_Cj = R_ji x_Ci + (p_IinCj - R_ji p_IinCi)
+      trans[{(size_t)i, (size_t)j}] =
+          params.camera_extrinsics.at(j).block(4, 0, 3, 1) - rots[{(size_t)i, (size_t)j}] * params.camera_extrinsics.at(i).block(4, 0, 3, 1);
     }
     trackFEATS->set_pair_rotations(rots);
+    trackFEATS->set_pair_translations(trans);
     PRINT_INFO("[RING]: %d cameras tracked as a ring of stereo pairs (0-1 ... %d-0)\n", N, N - 1);
   }
 
@@ -320,9 +325,17 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
       propagator->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       updaterZUPT->clean_old_imu_measurements(message.timestamp + state->_calib_dt_CAMtoIMU->value()(0) - 0.10);
       propagator->invalidate_cache();
+      if (params.zupt_stereo_landmarks) {
+        trackFEATS->set_standstill(true); // lets the ring tracker look for near objects in the neighbour camera
+        zupt_init_stereo_landmarks(message);
+      }
       return;
     }
   }
+  // not standing (any more)
+  zupt_stereo_first = -1;
+  if (params.zupt_stereo_landmarks)
+    trackFEATS->set_standstill(false);
 
   // If we do not have VIO initialization, then try to initialize
   // TODO: Or if we are trying to reset the system, then do that here!
@@ -337,6 +350,95 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
 
   // Call on our propagate and update function
   do_feature_propagate_update(message);
+}
+
+Eigen::Vector3d VioManager::landmark_in_global(const std::shared_ptr<ov_type::Landmark> &landmark) {
+  if (!ov_type::LandmarkRepresentation::is_relative_representation(landmark->_feat_representation))
+    return landmark->get_xyz(false);
+  Eigen::Matrix<double, 3, 3> R_ItoC = state->_calib_IMUtoCAM.at(landmark->_anchor_cam_id)->Rot();
+  Eigen::Matrix<double, 3, 1> p_IinC = state->_calib_IMUtoCAM.at(landmark->_anchor_cam_id)->pos();
+  Eigen::Matrix<double, 3, 3> R_GtoI = state->_clones_IMU.at(landmark->_anchor_clone_timestamp)->Rot();
+  Eigen::Matrix<double, 3, 1> p_IinG = state->_clones_IMU.at(landmark->_anchor_clone_timestamp)->pos();
+  return R_GtoI.transpose() * R_ItoC.transpose() * (landmark->get_xyz(false) - p_IinC) + p_IinG;
+}
+
+void VioManager::zupt_init_stereo_landmarks(const ov_core::CameraData &message) {
+
+  // Nothing to do without landmarks or without a second camera, or when the state is full
+  if (state->_options.max_slam_features <= 0 || state->_options.num_cameras < 2)
+    return;
+  if ((int)state->_features_SLAM.size() >= state->_options.max_slam_features)
+    return;
+
+  // Let the cross-camera matches of a fresh standstill build up first, then try at most every zupt_stereo_period
+  double time = message.timestamp;
+  if (zupt_stereo_first < 0 || time < zupt_stereo_first)
+    zupt_stereo_first = time;
+  if (time - zupt_stereo_first < params.dt_slam_delay || (zupt_stereo_last >= 0 && time >= zupt_stereo_last &&
+                                                          time - zupt_stereo_last < zupt_stereo_period))
+    return;
+
+  // Features with an observation in two cameras at this very time, that are no landmark yet and have not been
+  // tried (delayed_init marks what it used, success or not, and nothing cleans the database while standing)
+  std::vector<std::shared_ptr<Feature>> feats;
+  for (const auto &feat : trackFEATS->get_feature_database()->features_containing(time, false, true)) {
+    if (state->_features_SLAM.find(feat->featid) != state->_features_SLAM.end())
+      continue;
+    int cams_now = 0;
+    for (const auto &pair : feat->timestamps)
+      if (!pair.second.empty() && pair.second.back() == time)
+        cams_now++;
+    if (cams_now >= 2)
+      feats.push_back(feat);
+  }
+  if (feats.empty())
+    return;
+  int room = state->_options.max_slam_features - (int)state->_features_SLAM.size();
+  if ((int)feats.size() > room)
+    feats.resize(room);
+  zupt_stereo_last = time;
+
+  // The pose they are anchored in: a clone of the (still) state at this time. No motion, so no rotation rate.
+  size_t n_try = feats.size(), n_before = state->_features_SLAM.size();
+  if (state->_clones_IMU.find(state->_timestamp) == state->_clones_IMU.end())
+    StateHelper::augment_clone(state, Eigen::Vector3d::Zero());
+  std::vector<size_t> ids;
+  for (const auto &feat : feats)
+    ids.push_back(feat->featid);
+  updaterSLAM->delayed_init(state, feats);
+  propagator->invalidate_cache();
+  // delayed_init leaves in feats what it initialized: where each one is, to check against a known scene
+  for (const auto &feat : feats) {
+    auto lm = state->_features_SLAM.find(feat->featid);
+    if (lm == state->_features_SLAM.end() || !ov_type::LandmarkRepresentation::is_relative_representation(lm->second->_feat_representation))
+      continue;
+    size_t cam = lm->second->_anchor_cam_id;
+    if (feat->uvs.find(cam) == feat->uvs.end() || feat->uvs.at(cam).empty())
+      continue;
+    Eigen::Vector3d p_FinA = lm->second->get_xyz(false);
+    PRINT_DEBUG("[ZUPT-STEREO]: landmark %zu anchored in camera %zu at pixel %.1f %.1f, there %.3f %.3f %.3f (t %.6f)\n", feat->featid, cam,
+                feat->uvs.at(cam).back()(0), feat->uvs.at(cam).back()(1), p_FinA(0), p_FinA(1), p_FinA(2), time);
+  }
+
+  // Keep the clone window as the main update does: move the anchors off the oldest clone, then drop it
+  updaterSLAM->change_anchors(state);
+  StateHelper::marginalize_old_clone(state);
+
+  // What came of it
+  std::vector<double> dist;
+  for (size_t id : ids) {
+    auto lm = state->_features_SLAM.find(id);
+    if (lm == state->_features_SLAM.end())
+      continue;
+    Eigen::Vector3d p = landmark_in_global(lm->second);
+    zupt_stereo_init_pos[id] = p;
+    dist.push_back((p - state->_imu->pos()).norm());
+  }
+  std::sort(dist.begin(), dist.end());
+  PRINT_INFO(CYAN "[ZUPT-STEREO]: %zu of %zu features seen by two cameras became landmarks (%.2f / %.2f / %.2f m away), %zu in the "
+                  "state, %zu clones\n" RESET,
+             state->_features_SLAM.size() - n_before, n_try, dist.empty() ? 0.0 : dist.front(), dist.empty() ? 0.0 : dist[dist.size() / 2],
+             dist.empty() ? 0.0 : dist.back(), state->_features_SLAM.size(), state->_clones_IMU.size());
 }
 
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
@@ -377,6 +479,32 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     return;
   }
   has_moved_since_zupt = true;
+
+  // The landmarks a standstill initialized from two cameras: 3 s into the motion, say how many are still in the
+  // state and how far the motion's parallax moved them
+  if (!zupt_stereo_init_pos.empty()) {
+    if (zupt_stereo_moved < 0 || message.timestamp < zupt_stereo_moved)
+      zupt_stereo_moved = message.timestamp;
+    if (message.timestamp - zupt_stereo_moved >= 3.0) {
+      std::vector<double> moved, rel;
+      for (const auto &init : zupt_stereo_init_pos) {
+        auto lm = state->_features_SLAM.find(init.first);
+        if (lm == state->_features_SLAM.end())
+          continue;
+        Eigen::Vector3d p = landmark_in_global(lm->second);
+        moved.push_back((p - init.second).norm());
+        rel.push_back(moved.back() / std::max(0.05, (init.second - state->_imu->pos()).norm()));
+      }
+      std::sort(moved.begin(), moved.end());
+      std::sort(rel.begin(), rel.end());
+      PRINT_INFO(CYAN "[ZUPT-STEREO]: 3 s into the motion %zu of the %zu standstill landmarks are still in the state; they moved "
+                      "%.3f m (median, %.0f %% of their distance), %.3f m at most\n" RESET,
+                 moved.size(), zupt_stereo_init_pos.size(), moved.empty() ? 0.0 : moved[moved.size() / 2],
+                 rel.empty() ? 0.0 : 100.0 * rel[rel.size() / 2], moved.empty() ? 0.0 : moved.back());
+      zupt_stereo_init_pos.clear();
+      zupt_stereo_moved = -1;
+    }
+  }
 
   //===================================================================================
   // MSCKF features and KLT tracks that are SLAM features

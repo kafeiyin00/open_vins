@@ -137,6 +137,9 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
 
     // Remove the feature if not a success
     if (!success_tri || !success_refine) {
+      PRINT_DEBUG("[SLAM-DELAY]: feature %zu not triangulated (linear %d, refined %d; anchor camera %zu, there %.2f %.2f %.2f)\n",
+                  (*it1)->featid, (int)success_tri, (int)success_refine, (*it1)->anchor_cam_id, (*it1)->p_FinA(0), (*it1)->p_FinA(1),
+                  (*it1)->p_FinA(2));
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);
       continue;
@@ -235,6 +238,9 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
       (*it2)->to_delete = true;
       it2++;
     } else {
+      PRINT_DEBUG("[SLAM-DELAY]: feature %zu triangulated (anchor camera %zu, there %.2f %.2f %.2f, %d residuals) but failed the chi2 "
+                  "test of its initialization\n",
+                  (*it2)->featid, (*it2)->anchor_cam_id, (*it2)->p_FinA(0), (*it2)->p_FinA(1), (*it2)->p_FinA(2), (int)res.rows());
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
     }

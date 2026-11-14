@@ -984,6 +984,13 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
     // gate against the extrinsics keep the false matches out.
     auto rot_it = pair_rotations.find({cam_id_left, cam_id_right});
     bool have_rot = (rot_it != pair_rotations.end());
+    // Seeds along the epipolar curve for near objects: when the platform stands still (the frames are cheap then,
+    // and nothing but the two cameras' baseline can give a depth), or always if asked for. See ring_depth_seeds.
+    auto trans_it = pair_translations.find({cam_id_left, cam_id_right});
+    bool use_depths = have_rot && trans_it != pair_translations.end() && trans_it->second.norm() > 1e-4 &&
+                      (ring_depth_seeds >= 2 || (ring_depth_seeds == 1 && ring_standstill));
+    // nothing changes between two frames of a standstill: a track that did not match waits before the next try
+    int retry_frames = (use_depths && ring_standstill) ? std::max(ring_retry_frames, 15) : ring_retry_frames;
     std::vector<cv::Point2f> cand_pts0;   // location in the left image
     std::vector<int> cand_new;            // index into kpts0_new, or -1 for an existing track
     std::vector<size_t> cand_ids;         // id for existing tracks
@@ -998,7 +1005,7 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
       for (size_t i = 0; i < pts0.size(); i++) {
         if (ids_right.count(ids0.at(i)))
           continue;
-        if (ring_retry_frames > 0) {
+        if (retry_frames > 0) {
           auto r = retry.find(ids0.at(i));
           if (r != retry.end() && r->second > ring_frame)
             continue;
@@ -1008,13 +1015,20 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
         cand_ids.push_back(ids0.at(i));
       }
     }
-    std::vector<cv::Point2f> cand_pts1(cand_pts0.size());
+    // cand_inf: where the feature sits in the left image rendered in the right camera, which is where the right
+    // camera sees it if it is far away. cand_pts1: where it was found in the right image.
+    std::vector<cv::Point2f> cand_inf(cand_pts0.size()), cand_pts1(cand_pts0.size());
     std::vector<uchar> seed_ok(cand_pts0.size(), 0);
     std::vector<Eigen::Vector3d> bearing_pred(cand_pts0.size(), Eigen::Vector3d(0, 0, 1));
     int edge_r = 10;
+    auto usable_right = [&](const Eigen::Vector2f &p1) {
+      if (p1(0) < edge_r || p1(0) >= img1pyr.at(0).cols - edge_r || p1(1) < edge_r || p1(1) >= img1pyr.at(0).rows - edge_r)
+        return false;
+      return (int)mask1.at<uint8_t>((int)p1(1), (int)p1(0)) <= 127;
+    };
     for (size_t i = 0; i < cand_pts0.size(); i++) {
       if (!have_rot) {
-        cand_pts1.at(i) = cand_pts0.at(i);
+        cand_inf.at(i) = cand_pts1.at(i) = cand_pts0.at(i);
         seed_ok[i] = 1;
         continue;
       }
@@ -1026,64 +1040,97 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
         continue;
       Eigen::Vector2f n1((float)(b1(0) / b1(2)), (float)(b1(1) / b1(2)));
       Eigen::Vector2f p1 = camera_calib.at(cam_id_right)->distort_f(n1);
+      // the rendered left image has the feature there: it has to be inside the image. With depth seeds a far
+      // prediction in the right camera's mask is no reason to drop the candidate, a nearer one may be visible.
       if (p1(0) < edge_r || p1(0) >= img1pyr.at(0).cols - edge_r || p1(1) < edge_r || p1(1) >= img1pyr.at(0).rows - edge_r)
         continue;
-      if ((int)mask1.at<uint8_t>((int)p1(1), (int)p1(0)) > 127)
+      if (!use_depths && !usable_right(p1))
         continue;
-      cand_pts1.at(i) = cv::Point2f(p1(0), p1(1));
+      cand_inf.at(i) = cand_pts1.at(i) = cv::Point2f(p1(0), p1(1));
       bearing_pred.at(i) = b1;
       seed_ok[i] = 1;
     }
 
     std::vector<uchar> match_ok(cand_pts0.size(), 0);
-    int n_seeded_total = 0, n_klt = 0, n_fb = 0, n_ang = 0;
-    if (!cand_pts0.empty()) {
-      std::vector<cv::Point2f> src_pts, dst_pts;
-      std::vector<size_t> src_idx;
-      for (size_t i = 0; i < cand_pts0.size(); i++) {
-        if (!seed_ok[i])
-          continue;
-        n_seeded_total++;
-        src_idx.push_back(i);
-        // in the warped-left image the feature sits at its predicted right-image location
-        src_pts.push_back(have_rot ? cand_pts1.at(i) : cand_pts0.at(i));
-        dst_pts.push_back(cand_pts1.at(i));
+    int n_seeded_total = 0, n_klt = 0, n_fb = 0, n_ang = 0, n_depth = 0;
+    for (size_t i = 0; i < cand_pts0.size(); i++)
+      n_seeded_total += seed_ok[i] ? 1 : 0;
+    if (n_seeded_total > 0) {
+      boost::posix_time::ptime tw0 = now();
+      std::vector<cv::Mat> srcpyr;
+      if (have_rot && warped_pyr && !warped_pyr->empty()) {
+        srcpyr = *warped_pyr;
+      } else if (have_rot) {
+        const auto &maps = get_ring_map(cam_id_left, cam_id_right, img1pyr.at(0).rows, img1pyr.at(0).cols);
+        cv::Mat warped;
+        cv::remap(img0pyr.at(0), warped, maps.first, maps.second, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
+        cv::buildOpticalFlowPyramid(warped, srcpyr, win_size, ring_pyr_levels >= 0 ? ring_pyr_levels : pyr_levels);
+      } else {
+        srcpyr = img0pyr;
       }
-      if (!src_pts.empty()) {
-        boost::posix_time::ptime tw0 = now();
-        std::vector<cv::Mat> srcpyr;
-        if (have_rot && warped_pyr && !warped_pyr->empty()) {
-          srcpyr = *warped_pyr;
-        } else if (have_rot) {
-          const auto &maps = get_ring_map(cam_id_left, cam_id_right, img1pyr.at(0).rows, img1pyr.at(0).cols);
-          cv::Mat warped;
-          cv::remap(img0pyr.at(0), warped, maps.first, maps.second, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
-          cv::buildOpticalFlowPyramid(warped, srcpyr, win_size, ring_pyr_levels >= 0 ? ring_pyr_levels : pyr_levels);
-        } else {
-          srcpyr = img0pyr;
+      // the rendered left image has content in the overlap only: see ring_pyr_levels. The depth seeds are a
+      // level's reach apart, so one level less finds more of them (measured: 47 % against 35 %).
+      int klt_levels = (have_rot && ring_pyr_levels >= 0) ? ring_pyr_levels : pyr_levels;
+      if (use_depths)
+        klt_levels = std::min(klt_levels, 2);
+      boost::posix_time::ptime tw1 = now();
+      ring_t_warp += secs(tw0, tw1);
+
+      // Seed 0 is "far away". The others are depths along the left bearing, in baselines: on the 8 cm ring 2 m,
+      // 1 m, 0.6 m, 0.4 m, 0.3 m and 0.22 m, each about one KLT reach from the next in the image.
+      std::vector<double> seed_depths = {0.0};
+      Eigen::Vector3d t_LinR = Eigen::Vector3d::Zero(), epi = Eigen::Vector3d::Zero();
+      if (use_depths) {
+        t_LinR = trans_it->second;
+        epi = t_LinR.normalized();
+        for (double baselines : {25.0, 12.5, 7.5, 5.0, 3.75, 2.75})
+          seed_depths.push_back(baselines * t_LinR.norm());
+      }
+      double cos_max = std::cos(ring_max_angle_deg * M_PI / 180.0);
+      double sin_epi = std::sin(ring_epi_deg * M_PI / 180.0);
+      cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
+      for (size_t s = 0; s < seed_depths.size(); s++) {
+        std::vector<cv::Point2f> src_pts, dst_pts;
+        std::vector<size_t> src_idx;
+        for (size_t i = 0; i < cand_pts0.size(); i++) {
+          if (!seed_ok[i] || match_ok[i])
+            continue;
+          cv::Point2f seed = cand_inf.at(i);
+          if (s > 0) {
+            Eigen::Vector3d X = seed_depths[s] * bearing_pred.at(i) + t_LinR;
+            if (X(2) <= 0.05 * X.norm())
+              continue;
+            Eigen::Vector2f p1 = camera_calib.at(cam_id_right)->distort_f(Eigen::Vector2f((float)(X(0) / X(2)), (float)(X(1) / X(2))));
+            if (!usable_right(p1))
+              continue;
+            seed = cv::Point2f(p1(0), p1(1));
+          } else if (use_depths && !usable_right(Eigen::Vector2f(seed.x, seed.y))) {
+            continue;
+          }
+          src_idx.push_back(i);
+          // in the rendered left image the feature sits at its far-away location, whatever the seed
+          src_pts.push_back(cand_inf.at(i));
+          dst_pts.push_back(seed);
         }
-        // the rendered left image has content in the overlap only: see ring_pyr_levels
-        int klt_levels = (have_rot && ring_pyr_levels >= 0) ? ring_pyr_levels : pyr_levels;
-        boost::posix_time::ptime tw1 = now();
-        ring_t_warp += secs(tw0, tw1);
+        if (src_pts.empty())
+          continue;
+        boost::posix_time::ptime tk0 = now();
         std::vector<uchar> st_f, st_b;
         std::vector<float> err_f, err_b;
-        cv::TermCriteria term_crit = cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
         cv::calcOpticalFlowPyrLK(srcpyr, img1pyr, src_pts, dst_pts, st_f, err_f, win_size, klt_levels, term_crit,
                                  cv::OPTFLOW_USE_INITIAL_FLOW);
         std::vector<cv::Point2f> back_pts = src_pts;
         cv::calcOpticalFlowPyrLK(img1pyr, srcpyr, dst_pts, back_pts, st_b, err_b, win_size, klt_levels, term_crit,
                                  cv::OPTFLOW_USE_INITIAL_FLOW);
-        ring_t_klt += secs(tw1, now());
-        double cos_max = std::cos(ring_max_angle_deg * M_PI / 180.0);
+        ring_t_klt += secs(tk0, now());
         for (size_t k = 0; k < src_pts.size(); k++) {
           size_t i = src_idx[k];
           if (!st_f[k])
             continue;
-          n_klt++;
+          n_klt += (s == 0) ? 1 : 0;
           if (!st_b[k] || cv::norm(back_pts.at(k) - src_pts.at(k)) > ring_fb_px)
             continue;
-          n_fb++;
+          n_fb += (s == 0) ? 1 : 0;
           cv::Point2f p1 = dst_pts.at(k);
           if (p1.x < 0 || p1.y < 0 || (int)p1.x >= img1pyr.at(0).cols || (int)p1.y >= img1pyr.at(0).rows)
             continue;
@@ -1091,28 +1138,60 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
             Eigen::Vector2f n1 = camera_calib.at(cam_id_right)->undistort_f(Eigen::Vector2f(p1.x, p1.y));
             Eigen::Vector3d bm(n1(0), n1(1), 1.0);
             bm.normalize();
-            if (bm.dot(bearing_pred.at(i)) < cos_max)
+            if (use_depths) {
+              // the calibration says where it may be: in the plane of the far bearing and the left camera's
+              // centre, between that bearing and the centre (a positive depth)
+              if ((int)mask1.at<uint8_t>((int)p1.y, (int)p1.x) > 127)
+                continue;
+              Eigen::Vector3d n = bearing_pred.at(i).cross(epi);
+              if (n.norm() < 1e-6 || std::abs(n.normalized().dot(bm)) > sin_epi)
+                continue;
+              if (bearing_pred.at(i).cross(bm).dot(n) < -1e-4)
+                continue;
+            } else if (bm.dot(bearing_pred.at(i)) < cos_max) {
               continue;
+            }
           }
           n_ang++;
+          n_depth += (s > 0) ? 1 : 0;
           match_ok[i] = 1;
           cand_pts1.at(i) = p1;
         }
       }
-      PRINT_ALL("[RING-PAIR] cam%zu->cam%zu rot=%d: %d new + %d existing candidates, %d seeded, %d klt, %d fb, %d angle -> stereo\n",
+      PRINT_ALL("[RING-PAIR] cam%zu->cam%zu rot=%d: %d new + %d existing candidates, %d seeded, %d klt, %d fb, %d angle -> stereo"
+                " (%d of them from a depth seed)\n",
                 cam_id_left, cam_id_right, (int)have_rot, (int)kpts0_new.size(), (int)(cand_pts0.size() - kpts0_new.size()),
-                n_seeded_total, n_klt, n_fb, n_ang);
+                n_seeded_total, n_klt, n_fb, n_ang, n_depth);
+    }
+    if (!cand_pts0.empty()) {
 
-      // An existing track that did not make it into the right camera waits ring_retry_frames before the next try
-      if (have_rot && ring_retry_frames > 0) {
+      // An existing track that did not make it into the right camera waits retry_frames before the next try
+      if (have_rot && retry_frames > 0) {
         auto &retry = ring_retry[{cam_id_left, cam_id_right}];
         for (size_t i = 0; i < cand_pts0.size(); i++)
           if (cand_new[i] < 0 && !match_ok[i])
-            retry[cand_ids[i]] = ring_frame + ring_retry_frames;
+            retry[cand_ids[i]] = ring_frame + retry_frames;
         if (ring_frame % 64 == 0) // forget the ids that are long gone
           for (auto r = retry.begin(); r != retry.end();)
             r = (r->second < ring_frame) ? retry.erase(r) : std::next(r);
       }
+
+      // A match lands where the right camera may already track the same corner under an id of its own (after a
+      // standstill it nearly always does: both cameras found it long ago). When this camera is the left one of
+      // its other pair, the later of two points within min_px_dist goes, and that was the match: it never lasted
+      // a frame. The camera's own point makes way instead, unless a second camera sees that one too.
+      std::vector<uchar> drop1(pts1.size(), 0);
+      auto make_room = [&](const cv::Point2f &p) {
+        int xc = (int)(p.x / (float)min_px_dist), yc = (int)(p.y / (float)min_px_dist);
+        for (size_t j = 0; j < drop1.size(); j++) {
+          if (drop1[j] || (int)(pts1[j].pt.x / (float)min_px_dist) != xc || (int)(pts1[j].pt.y / (float)min_px_dist) != yc)
+            continue;
+          if (ring_multi_ids.count(ids1[j]))
+            return false;
+          drop1[j] = 1;
+        }
+        return true;
+      };
 
       // Record: new features go to the left (and to the right if matched), existing tracks gain a right observation
       for (size_t i = 0; i < cand_pts0.size(); i++) {
@@ -1124,20 +1203,33 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
           size_t temp = ++currid;
           pts0.push_back(kp0);
           ids0.push_back(temp);
-          if (match_ok[i]) {
+          if (match_ok[i] && make_room(cand_pts1.at(i))) {
             cv::KeyPoint kp1 = kp0;
             kp1.pt = cand_pts1.at(i);
             pts1.push_back(kp1);
             ids1.push_back(temp);
+            ring_multi_ids.insert(temp);
           }
-        } else if (match_ok[i]) {
+        } else if (match_ok[i] && make_room(cand_pts1.at(i))) {
           cv::KeyPoint kp1;
           kp1.pt = cand_pts1.at(i);
           kp1.size = 7;
           pts1.push_back(kp1);
           ids1.push_back(cand_ids[i]);
+          ring_multi_ids.insert(cand_ids[i]);
         }
       }
+      // the points that made way (drop1 covers the points the camera had before this pair)
+      size_t keep = 0;
+      for (size_t j = 0; j < pts1.size(); j++) {
+        if (j < drop1.size() && drop1[j])
+          continue;
+        pts1[keep] = pts1[j];
+        ids1[keep] = ids1[j];
+        keep++;
+      }
+      pts1.resize(keep);
+      ids1.resize(keep);
     }
   }
 
@@ -1357,9 +1449,10 @@ void TrackKLT::feed_ring(const CameraData &message) {
     ring_retry_frames = std::max(0, env("OV_RING_RETRY_FRAMES", 0));
     ring_right_fast = env("OV_RING_RIGHT_FAST", 1);
     ring_pyr_levels = std::min(pyr_levels, std::max(0, env("OV_RING_PYR_LEVELS", 3)));
+    ring_depth_seeds = env("OV_RING_DEPTH_SEEDS", 0);
     PRINT_INFO("[RING]: parallel warp %d, retry a failed cross-camera match after %d frames, right-image top-up %d, "
-               "cross-camera KLT up to pyramid level %d (temporal %d)\n",
-               ring_parallel_warp, ring_retry_frames, ring_right_fast, ring_pyr_levels, pyr_levels);
+               "cross-camera KLT up to pyramid level %d (temporal %d), depth seeds %d (0 never, 1 standing still, 2 always)\n",
+               ring_parallel_warp, ring_retry_frames, ring_right_fast, ring_pyr_levels, pyr_levels, ring_depth_seeds);
   }
   ring_frame++;
   ring_t_fast0 = ring_t_warp = ring_t_klt = ring_t_fast1 = 0;
@@ -1429,6 +1522,15 @@ void TrackKLT::feed_ring(const CameraData &message) {
                     }
                   }));
     ring_t_warp += (boost::posix_time::microsec_clock::local_time() - tw0).total_microseconds() * 1e-6;
+  }
+  // the ids more than one camera tracks, for perform_detection_pair (it adds what it matches)
+  ring_multi_ids.clear();
+  {
+    std::unordered_map<size_t, int> seen;
+    for (size_t k = 0; k < N; k++)
+      for (size_t id : ids_old[k])
+        if (++seen[id] == 2)
+          ring_multi_ids.insert(id);
   }
   for (size_t k = 0; k < N; k++) {
     size_t L = k, R = (k + 1) % N;

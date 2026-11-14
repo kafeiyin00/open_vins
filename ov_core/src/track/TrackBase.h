@@ -163,6 +163,12 @@ public:
    */
   virtual void set_pair_rotations(const std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> &rots) { pair_rotations = rots; }
 
+  /// Ring stereo: the first camera's centre in the second camera's frame, for the same pairs (depth seeds, epipolar gate)
+  virtual void set_pair_translations(const std::map<std::pair<size_t, size_t>, Eigen::Vector3d> &trans) { pair_translations = trans; }
+
+  /// Ring stereo: whether the platform stands still (the estimator's zero velocity update held the last frame)
+  virtual void set_standstill(bool still) { ring_standstill = still; }
+
 protected:
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
@@ -172,6 +178,10 @@ protected:
 
   /// Ring stereo: R_{j<-i} for adjacent camera pairs (see set_pair_rotations)
   std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> pair_rotations;
+  /// Ring stereo: p_{i in j} for the same pairs (see set_pair_translations)
+  std::map<std::pair<size_t, size_t>, Eigen::Vector3d> pair_translations;
+  /// Ring stereo: see set_standstill
+  std::atomic<bool> ring_standstill{false};
 
   /// If we are a fisheye model or not
   std::map<size_t, bool> camera_fisheye;

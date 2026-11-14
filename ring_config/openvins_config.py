@@ -238,6 +238,9 @@ imu0:
         # pass for standing still. Dynamic init covers a start in motion.
         'try_zupt': ('true', 'a still start initializes at once, no jerk needed'),
         'zupt_only_at_beginning': ('true', 'only until the first motion, never in a hover'),
+        # Standing still there is no parallax and ZUPT skips the visual update: no 3d point until the first motion,
+        # which for a vehicle is the take-off. Features two cameras of the ring see at once do not need motion.
+        'zupt_stereo_landmarks': ('true', 'landmarks from two-camera features while standing still'),
         'init_dyn_use': ('true', 'for a start in motion; a still start uses the static one'),
         'use_mask': ('true', None),
         'filepath_est': ('"/tmp/ov_estimate.txt"', None),
