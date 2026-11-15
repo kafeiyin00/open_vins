@@ -188,6 +188,49 @@ protected:
     double features = 0, shared = 0, detected = 0, t_det = 0, t_fast0 = 0, t_warp = 0, t_klt = 0, t_fast1 = 0, t0 = -1;
   } ring_stats;
 
+  // Active perception, SLAM side (NV_SIM paper, 2026-11-14): more triangulated landmarks towards the goal. Read from the
+  // environment on the first ring frame:
+  //   OV_GOAL_FILE    rows "t gx gy gz": the goal direction in the IMU frame against the camera clock (nearest row within
+  //                   0.2 s is used); unset = goal-directed density off
+  //   OV_GOAL_DEG (30)       half-angle of the goal sector
+  //   OV_GOAL_FEATS (40)     per left camera of a pair, top the goal sector up to this many features with a lower FAST
+  //                          threshold and OV_GOAL_MIN_PX (5) spacing, and match them (and the sector's existing tracks)
+  //                          across even when the camera needs no new features
+  //   OV_GOAL_DEPTHS ("")    comma-separated depth hypotheses (m), e.g. "2,1,0.6,0.4": a candidate the far-point seed did
+  //                          not match is seeded again at the projection of the point at each depth; an epipolar gate
+  //                          (OV_GOAL_EPI_DEG, 1.5) replaces the 15 deg bearing gate for these. Applied in the goal sector,
+  //                          or to every candidate with OV_GOAL_HYP_ALL=1 (the compute-matched uniform control)
+  //   OV_GOAL_STATS          append one line per frame: t, sector features, new sector features, stereo matches from
+  //                          the far-point seed, from depth hypotheses, goal-stage time (ms), ring detection time (ms)
+  int goal_on = -1, goal_feats = 40, goal_min_px = 5, goal_hyp_all = 0;
+  double goal_cos = 0.866, goal_epi_sin = 0.026;
+  std::vector<double> goal_depths;
+  std::vector<std::pair<double, Eigen::Vector3d>> goal_track;
+  Eigen::Vector3d goal_I = Eigen::Vector3d::Zero();
+  bool goal_valid = false;
+  double ring_t_goal = 0;
+  int goal_n_roi = 0, goal_n_new = 0, goal_n_far = 0, goal_n_hyp = 0;
+  FILE *goal_stats = nullptr;
+  bool in_goal(size_t cam, const cv::Point2f &pt) const;
+  // per camera, the unit bearing of every 4th pixel (lazily built), so that in_goal needs no undistortion
+  mutable std::map<size_t, cv::Mat> goal_bearings;
+  mutable std::mutex goal_bearings_mtx;
+  void goal_setup();
+  // Allocation map (NV_SIM, 2026-11-15; generalises the goal sector): a per-frame weight over the directions OV_ALLOC_DIRS (rows
+  // "x y z", IMU frame; HEALPix nside 4 centres) from OV_ALLOC_FILE (rows "t w_0 .. w_{n-1}", camera clock, nearest row within
+  // 0.2 s). Direction d is topped up to floor(target_d), target_d = OV_ALLOC_FEATS * w_d / sum(w), tracked features (counted per camera; FAST at half
+  // the threshold, OV_GOAL_MIN_PX spacing); directions with target_d >= 1 are "active": their candidates are matched across
+  // cameras also when the camera needs no new features, and get the depth hypotheses (OV_GOAL_DEPTHS). Same budget, different
+  // allocation: the policies differ only in w.
+  int alloc_on = 0, alloc_feats = 60;
+  std::vector<Eigen::Vector3d> alloc_dirs;
+  std::vector<std::pair<double, std::vector<float>>> alloc_track;
+  std::vector<float> alloc_target;
+  bool alloc_valid = false;
+  mutable std::map<size_t, cv::Mat> alloc_idx;
+  int alloc_dir(size_t cam, const cv::Point2f &pt) const;
+  const cv::Mat *alloc_table(size_t cam) const;   // the per-camera direction index of every 4th pixel (built once, locked once)
+
   /// Ring stereo: per pair, remap tables that render the LEFT image in the RIGHT camera's projection (far-point assumption)
   std::map<std::pair<size_t, size_t>, std::pair<cv::Mat, cv::Mat>> ring_maps;
   std::mutex ring_maps_mtx;

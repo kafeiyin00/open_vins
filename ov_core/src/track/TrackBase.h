@@ -163,6 +163,12 @@ public:
    */
   virtual void set_pair_rotations(const std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> &rots) { pair_rotations = rots; }
 
+  /// Ring: the camera extrinsics (R_ItoC, p_IinC), for depth hypotheses of the cross-camera match and the goal direction
+  virtual void set_ring_extrinsics(const std::map<size_t, Eigen::Matrix3d> &R_ItoC, const std::map<size_t, Eigen::Vector3d> &p_IinC) {
+    ring_R_ItoC = R_ItoC;
+    ring_p_IinC = p_IinC;
+  }
+
 protected:
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
@@ -172,6 +178,10 @@ protected:
 
   /// Ring stereo: R_{j<-i} for adjacent camera pairs (see set_pair_rotations)
   std::map<std::pair<size_t, size_t>, Eigen::Matrix3d> pair_rotations;
+
+  /// Ring: camera extrinsics (see set_ring_extrinsics)
+  std::map<size_t, Eigen::Matrix3d> ring_R_ItoC;
+  std::map<size_t, Eigen::Vector3d> ring_p_IinC;
 
   /// If we are a fisheye model or not
   std::map<size_t, bool> camera_fisheye;

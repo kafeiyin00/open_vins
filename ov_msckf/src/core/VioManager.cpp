@@ -153,6 +153,13 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
       rots[{(size_t)i, (size_t)j}] = R_ItoCj * R_ItoCi.transpose();
     }
     trackFEATS->set_pair_rotations(rots);
+    std::map<size_t, Eigen::Matrix3d> R_ItoC;
+    std::map<size_t, Eigen::Vector3d> p_IinC;
+    for (int i = 0; i < N; i++) {
+      R_ItoC[(size_t)i] = ov_core::quat_2_Rot(params.camera_extrinsics.at(i).block(0, 0, 4, 1));
+      p_IinC[(size_t)i] = params.camera_extrinsics.at(i).block(4, 0, 3, 1);
+    }
+    trackFEATS->set_ring_extrinsics(R_ItoC, p_IinC);
     PRINT_INFO("[RING]: %d cameras tracked as a ring of stereo pairs (0-1 ... %d-0)\n", N, N - 1);
   }
 

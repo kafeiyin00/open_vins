@@ -19,6 +19,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include <cstdio>
+#include <fstream>
+#include <sstream>
 #include "TrackKLT.h"
 
 #include <cstdint>
@@ -931,46 +934,186 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
   // LEFT: if we need features we should extract them in the current frame
   // LEFT: we will also try to track them from this frame over to the right frame
   // LEFT: in the case that we have two features that are the same, then we should merge them
-  if (num_featsneeded_0 > std::min(20, (int)(min_feat_percent * num_features))) {
-
-    // This is old extraction code that would extract from the whole image
-    // This can be slow as this will recompute extractions for grid areas that we have max features already
-    // std::vector<cv::KeyPoint> pts0_ext;
-    // Grider_FAST::perform_griding(img0pyr.at(0), mask0_updated, pts0_ext, num_features, grid_x, grid_y, threshold, true);
-
-    // We also check a downsampled mask such that we don't extract in areas where it is all masked!
-    cv::Mat mask0_grid;
-    int num_features_grid = grid_budget(mask0, size_grid0, num_features, mask0_grid);
-
-    // Create grids we need to extract from and then extract our features (use fast with griding)
-    int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
-    std::vector<std::pair<int, int>> valid_locs;
-    for (int x = 0; x < grid_2d_grid0.cols; x++) {
-      for (int y = 0; y < grid_2d_grid0.rows; y++) {
-        if ((int)grid_2d_grid0.at<uint8_t>(y, x) < num_features_grid_req && (int)mask0_grid.at<uint8_t>(y, x) != 255) {
-          valid_locs.emplace_back(x, y);
-        }
-      }
-    }
-    std::vector<cv::KeyPoint> pts0_ext;
-    Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext, num_features, grid_x, grid_y, threshold, true);
-
-    // Now, reject features that are close a current feature
+  bool need_std0 = num_featsneeded_0 > std::min(20, (int)(min_feat_percent * num_features));
+  bool goal_here = (goal_valid && goal_on > 0) || (alloc_valid && alloc_on > 0);
+  if (need_std0 || goal_here) {
     std::vector<cv::KeyPoint> kpts0_new;
     std::vector<cv::Point2f> pts0_new;
-    for (auto &kpt : pts0_ext) {
-      // Check that it is in bounds
-      int x_grid = (int)(kpt.pt.x / (float)min_px_dist);
-      int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
-      if (x_grid < 0 || x_grid >= size_close0.width || y_grid < 0 || y_grid >= size_close0.height)
-        continue;
-      // See if there is a point at this location
-      if (grid_2d_close0.at<uint8_t>(y_grid, x_grid) > 127)
-        continue;
-      // Else lets add it!
-      grid_2d_close0.at<uint8_t>(y_grid, x_grid) = 255;
-      kpts0_new.push_back(kpt);
-      pts0_new.push_back(kpt.pt);
+    if (need_std0) {
+
+      // This is old extraction code that would extract from the whole image
+      // This can be slow as this will recompute extractions for grid areas that we have max features already
+      // std::vector<cv::KeyPoint> pts0_ext;
+      // Grider_FAST::perform_griding(img0pyr.at(0), mask0_updated, pts0_ext, num_features, grid_x, grid_y, threshold, true);
+
+      // We also check a downsampled mask such that we don't extract in areas where it is all masked!
+      cv::Mat mask0_grid;
+      int num_features_grid = grid_budget(mask0, size_grid0, num_features, mask0_grid);
+
+      // Create grids we need to extract from and then extract our features (use fast with griding)
+      int num_features_grid_req = std::max(1, (int)(min_feat_percent * num_features_grid));
+      std::vector<std::pair<int, int>> valid_locs;
+      for (int x = 0; x < grid_2d_grid0.cols; x++) {
+        for (int y = 0; y < grid_2d_grid0.rows; y++) {
+          if ((int)grid_2d_grid0.at<uint8_t>(y, x) < num_features_grid_req && (int)mask0_grid.at<uint8_t>(y, x) != 255) {
+            valid_locs.emplace_back(x, y);
+          }
+        }
+      }
+      std::vector<cv::KeyPoint> pts0_ext;
+      Grider_GRID::perform_griding(img0pyr.at(0), mask0_updated, valid_locs, pts0_ext, num_features, grid_x, grid_y, threshold, true);
+
+      // Now, reject features that are close a current feature
+      for (auto &kpt : pts0_ext) {
+        // Check that it is in bounds
+        int x_grid = (int)(kpt.pt.x / (float)min_px_dist);
+        int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
+        if (x_grid < 0 || x_grid >= size_close0.width || y_grid < 0 || y_grid >= size_close0.height)
+          continue;
+        // See if there is a point at this location
+        if (grid_2d_close0.at<uint8_t>(y_grid, x_grid) > 127)
+          continue;
+        // Else lets add it!
+        grid_2d_close0.at<uint8_t>(y_grid, x_grid) = 255;
+        kpts0_new.push_back(kpt);
+        pts0_new.push_back(kpt.pt);
+      }
+    }
+
+    // Active perception: top the goal sector up with features (lower FAST threshold, finer spacing), also when the camera
+    // needs no new features, so that the sector is matched across and triangulated (see TrackKLT.h, OV_GOAL_*)
+    if (goal_here && alloc_on > 0) {
+      // allocation map: top every direction up to its target (see TrackKLT.h)
+      boost::posix_time::ptime tg0 = now();
+      const cv::Mat &im = img0pyr.at(0);
+      const cv::Mat *tab = alloc_table(cam_id_left);
+      auto alloc_dir = [tab](size_t, const cv::Point2f &pt) -> int {
+        if (!tab)
+          return -1;
+        int x = std::min(std::max((int)(pt.x / 4.0f), 0), tab->cols - 1), y = std::min(std::max((int)(pt.y / 4.0f), 0), tab->rows - 1);
+        return tab->at<int16_t>(y, x);
+      };
+      std::vector<int> cnt(alloc_dirs.size(), 0);
+      for (const auto &k : pts0) {
+        int d = alloc_dir(cam_id_left, k.pt);
+        if (d >= 0) cnt[d]++;
+      }
+      for (const auto &k : kpts0_new) {
+        int d = alloc_dir(cam_id_left, k.pt);
+        if (d >= 0) cnt[d]++;
+      }
+      int x0 = im.cols, y0 = im.rows, x1 = -1, y1 = -1;              // bounding box of the grid cells whose direction needs features
+      for (int y = 8; y < im.rows; y += 16)
+        for (int x = 8; x < im.cols; x += 16) {
+          int d = alloc_dir(cam_id_left, cv::Point2f((float)x, (float)y));
+          if (d >= 0 && alloc_target[d] >= 1.0f && cnt[d] < (int)alloc_target[d])
+            x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y);
+        }
+      int n_add = 0;
+      if (x1 >= x0) {
+        cv::Rect roi(std::max(0, x0 - 16), std::max(0, y0 - 16), 0, 0);
+        roi.width = std::min(im.cols, x1 + 16) - roi.x;
+        roi.height = std::min(im.rows, y1 + 16) - roi.y;
+        std::vector<cv::KeyPoint> fast;
+        cv::FAST(im(roi), fast, std::max(5, threshold / 2), true);
+        for (auto &kp : fast)
+          kp.pt += cv::Point2f((float)roi.x, (float)roi.y);
+        std::sort(fast.begin(), fast.end(), [](const cv::KeyPoint &p, const cv::KeyPoint &q) { return p.response > q.response; });
+        cv::Mat occ = cv::Mat::zeros(im.rows / goal_min_px + 1, im.cols / goal_min_px + 1, CV_8UC1);
+        auto mark = [&](const cv::Point2f &q) {
+          int gx = (int)(q.x / goal_min_px), gy = (int)(q.y / goal_min_px);
+          if (gx >= 0 && gy >= 0 && gx < occ.cols && gy < occ.rows)
+            occ.at<uint8_t>(gy, gx) = 255;
+        };
+        for (const auto &k : pts0)
+          mark(k.pt);
+        for (const auto &k : kpts0_new)
+          mark(k.pt);
+        for (const auto &kp : fast) {
+          if (n_add >= alloc_feats)
+            break;
+          int x = (int)kp.pt.x, y = (int)kp.pt.y;
+          if (x < 10 || y < 10 || x >= im.cols - 10 || y >= im.rows - 10)
+            continue;
+          if (mask0.at<uint8_t>(y, x) > 127)
+            continue;
+          int gx = x / goal_min_px, gy = y / goal_min_px;
+          if (occ.at<uint8_t>(gy, gx) > 127)
+            continue;
+          int d = alloc_dir(cam_id_left, kp.pt);
+          if (d < 0 || alloc_target[d] < 1.0f || cnt[d] >= (int)alloc_target[d])
+            continue;
+          occ.at<uint8_t>(gy, gx) = 255;
+          kpts0_new.push_back(kp);
+          pts0_new.push_back(kp.pt);
+          cnt[d]++;
+          n_add++;
+        }
+      }
+      int n_act = 0;
+      for (size_t d = 0; d < cnt.size(); d++)
+        if (alloc_target[d] >= 1.0f)
+          n_act += cnt[d];
+      goal_n_roi += n_act;
+      goal_n_new += n_add;
+      ring_t_goal += secs(tg0, now());
+    } else if (goal_here) {
+      boost::posix_time::ptime tg0 = now();
+      const cv::Mat &im = img0pyr.at(0);
+      int n_roi = 0, n_add = 0;
+      for (const auto &k : pts0)
+        if (in_goal(cam_id_left, k.pt))
+          n_roi++;
+      for (const auto &k : kpts0_new)
+        if (in_goal(cam_id_left, k.pt))
+          n_roi++;
+      if (n_roi < goal_feats) {
+        int x0 = im.cols, y0 = im.rows, x1 = -1, y1 = -1;
+        for (int y = 8; y < im.rows; y += 16)
+          for (int x = 8; x < im.cols; x += 16)
+            if (in_goal(cam_id_left, cv::Point2f((float)x, (float)y))) {
+              x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y);
+            }
+        if (x1 >= x0) {
+          cv::Rect roi(std::max(0, x0 - 16), std::max(0, y0 - 16), 0, 0);
+          roi.width = std::min(im.cols, x1 + 16) - roi.x;
+          roi.height = std::min(im.rows, y1 + 16) - roi.y;
+          std::vector<cv::KeyPoint> fast;
+          cv::FAST(im(roi), fast, std::max(5, threshold / 2), true);
+          for (auto &kp : fast)
+            kp.pt += cv::Point2f((float)roi.x, (float)roi.y);
+          std::sort(fast.begin(), fast.end(), [](const cv::KeyPoint &p, const cv::KeyPoint &q) { return p.response > q.response; });
+          cv::Mat occ = cv::Mat::zeros(im.rows / goal_min_px + 1, im.cols / goal_min_px + 1, CV_8UC1);
+          auto mark = [&](const cv::Point2f &q) {
+            int gx = (int)(q.x / goal_min_px), gy = (int)(q.y / goal_min_px);
+            if (gx >= 0 && gy >= 0 && gx < occ.cols && gy < occ.rows)
+              occ.at<uint8_t>(gy, gx) = 255;
+          };
+          for (const auto &k : pts0)
+            mark(k.pt);
+          for (const auto &k : kpts0_new)
+            mark(k.pt);
+          for (const auto &kp : fast) {
+            if (n_roi + n_add >= goal_feats)
+              break;
+            int x = (int)kp.pt.x, y = (int)kp.pt.y;
+            if (x < 10 || y < 10 || x >= im.cols - 10 || y >= im.rows - 10)
+              continue;
+            if (mask0.at<uint8_t>(y, x) > 127)
+              continue;
+            int gx = x / goal_min_px, gy = y / goal_min_px;
+            if (occ.at<uint8_t>(gy, gx) > 127 || !in_goal(cam_id_left, kp.pt))
+              continue;
+            occ.at<uint8_t>(gy, gx) = 255;
+            kpts0_new.push_back(kp);
+            pts0_new.push_back(kp.pt);
+            n_add++;
+          }
+        }
+      }
+      goal_n_roi += n_roi + n_add;
+      goal_n_new += n_add;
+      ring_t_goal += secs(tg0, now());
     }
 
     ring_t_fast0 += secs(tp0, now());
@@ -997,6 +1140,8 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
       auto &retry = ring_retry[{cam_id_left, cam_id_right}];
       for (size_t i = 0; i < pts0.size(); i++) {
         if (ids_right.count(ids0.at(i)))
+          continue;
+        if (!need_std0 && !in_goal(cam_id_left, pts0.at(i).pt))
           continue;
         if (ring_retry_frames > 0) {
           auto r = retry.find(ids0.at(i));
@@ -1097,6 +1242,71 @@ void TrackKLT::perform_detection_pair(const std::vector<cv::Mat> &img0pyr, const
           n_ang++;
           match_ok[i] = 1;
           cand_pts1.at(i) = p1;
+        }
+        goal_n_far += n_ang;
+        // Active perception: depth hypotheses. A candidate the far-point seed missed is seeded again where the point
+        // would appear at each hypothesised depth (near points are tens of px off the far-point prediction); an epipolar
+        // gate replaces the bearing gate for these matches.
+        if (have_rot && !goal_depths.empty() && (goal_here || goal_hyp_all) && ring_R_ItoC.count(cam_id_left) &&
+            ring_R_ItoC.count(cam_id_right)) {
+          boost::posix_time::ptime th0 = now();
+          const Eigen::Matrix3d &Rlr = rot_it->second;
+          Eigen::Vector3d t_lr = ring_p_IinC.at(cam_id_right) - Rlr * ring_p_IinC.at(cam_id_left);   // left origin in the right frame
+          double cos30 = std::cos(30.0 * M_PI / 180.0);
+          for (double dh : goal_depths) {
+            std::vector<cv::Point2f> s2, d2;
+            std::vector<size_t> i2;
+            std::vector<Eigen::Vector3d> binf2;
+            for (size_t i = 0; i < cand_pts0.size(); i++) {
+              if (!seed_ok[i] || match_ok[i])
+                continue;
+              if (!goal_hyp_all && !in_goal(cam_id_left, cand_pts0.at(i)))
+                continue;
+              Eigen::Vector2f n0 = camera_calib.at(cam_id_left)->undistort_f(Eigen::Vector2f(cand_pts0.at(i).x, cand_pts0.at(i).y));
+              Eigen::Vector3d b0(n0(0), n0(1), 1.0);
+              b0.normalize();
+              Eigen::Vector3d q = Rlr * b0 + t_lr / dh;
+              if (q(2) <= 0.05)
+                continue;
+              Eigen::Vector2f ph = camera_calib.at(cam_id_right)->distort_f(Eigen::Vector2f((float)(q(0) / q(2)), (float)(q(1) / q(2))));
+              if (ph(0) < edge_r || ph(0) >= img1pyr.at(0).cols - edge_r || ph(1) < edge_r || ph(1) >= img1pyr.at(0).rows - edge_r)
+                continue;
+              if ((int)mask1.at<uint8_t>((int)ph(1), (int)ph(0)) > 127)
+                continue;
+              s2.push_back(cand_pts1.at(i));
+              d2.push_back(cv::Point2f(ph(0), ph(1)));
+              i2.push_back(i);
+              binf2.push_back(Rlr * b0);
+            }
+            if (s2.empty())
+              continue;
+            std::vector<uchar> sf, sb;
+            std::vector<float> ef, eb;
+            cv::calcOpticalFlowPyrLK(srcpyr, img1pyr, s2, d2, sf, ef, win_size, klt_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
+            std::vector<cv::Point2f> bk = s2;
+            cv::calcOpticalFlowPyrLK(img1pyr, srcpyr, d2, bk, sb, eb, win_size, klt_levels, term_crit, cv::OPTFLOW_USE_INITIAL_FLOW);
+            for (size_t k = 0; k < s2.size(); k++) {
+              size_t i = i2[k];
+              if (match_ok[i] || !sf[k] || !sb[k] || cv::norm(bk.at(k) - s2.at(k)) > ring_fb_px)
+                continue;
+              cv::Point2f p1 = d2.at(k);
+              if (p1.x < 0 || p1.y < 0 || (int)p1.x >= img1pyr.at(0).cols || (int)p1.y >= img1pyr.at(0).rows)
+                continue;
+              Eigen::Vector2f n1 = camera_calib.at(cam_id_right)->undistort_f(Eigen::Vector2f(p1.x, p1.y));
+              Eigen::Vector3d bm(n1(0), n1(1), 1.0);
+              bm.normalize();
+              Eigen::Vector3d ne = binf2[k].cross(t_lr);
+              if (ne.norm() < 1e-12)
+                continue;
+              ne.normalize();
+              if (std::abs(bm.dot(ne)) > goal_epi_sin || bm.dot(binf2[k].normalized()) < cos30)
+                continue;
+              match_ok[i] = 1;
+              cand_pts1.at(i) = p1;
+              goal_n_hyp++;
+            }
+          }
+          ring_t_goal += secs(th0, now());
         }
       }
       PRINT_ALL("[RING-PAIR] cam%zu->cam%zu rot=%d: %d new + %d existing candidates, %d seeded, %d klt, %d fb, %d angle -> stereo\n",
@@ -1363,6 +1573,47 @@ void TrackKLT::feed_ring(const CameraData &message) {
   }
   ring_frame++;
   ring_t_fast0 = ring_t_warp = ring_t_klt = ring_t_fast1 = 0;
+  if (goal_on < 0)
+    goal_setup();
+  goal_valid = false;
+  ring_t_goal = 0;
+  goal_n_roi = goal_n_new = goal_n_far = goal_n_hyp = 0;
+  alloc_valid = false;
+  if (alloc_on > 0) {
+    auto it = std::lower_bound(alloc_track.begin(), alloc_track.end(), message.timestamp,
+                               [](const std::pair<double, std::vector<float>> &a, double t) { return a.first < t; });
+    double best = 1e9;
+    const std::vector<float> *w = nullptr;
+    for (auto c : {it, it == alloc_track.begin() ? it : std::prev(it)})
+      if (c != alloc_track.end() && std::abs(c->first - message.timestamp) < best) {
+        best = std::abs(c->first - message.timestamp);
+        w = &c->second;
+      }
+    if (w && best < 0.2) {
+      double sw = 0;
+      for (float v : *w)
+        sw += std::max(0.0f, v);
+      if (sw > 0) {
+        alloc_target.assign(w->size(), 0.0f);
+        for (size_t d = 0; d < w->size(); d++)
+          alloc_target[d] = (float)(alloc_feats * std::max(0.0f, (*w)[d]) / sw);
+        alloc_valid = true;
+      }
+    }
+  }
+  if (goal_on > 0) {
+    auto it = std::lower_bound(goal_track.begin(), goal_track.end(), message.timestamp,
+                               [](const std::pair<double, Eigen::Vector3d> &a, double t) { return a.first < t; });
+    double best = 1e9;
+    for (auto c : {it, it == goal_track.begin() ? it : std::prev(it)})
+      if (c != goal_track.end() && std::abs(c->first - message.timestamp) < best) {
+        best = std::abs(c->first - message.timestamp);
+        goal_I = c->second;
+      }
+    goal_valid = best < 0.2 && goal_I.norm() > 1e-6;
+    if (goal_valid)
+      goal_I.normalize();
+  }
 
   std::vector<cv::Mat> imgs(N), masks(N);
   std::vector<std::vector<cv::Mat>> pyrs(N);
@@ -1508,6 +1759,12 @@ void TrackKLT::feed_ring(const CameraData &message) {
   PRINT_ALL("[TIME-KLT]: ring detection stages %.4f left FAST, %.4f warp, %.4f cross KLT, %.4f right FAST\n", ring_t_fast0, ring_t_warp,
             ring_t_klt, ring_t_fast1);
 
+  if (goal_stats) {
+    std::fprintf(goal_stats, "%.4f %d %d %d %d %.3f %.3f\n", message.timestamp, goal_n_roi, goal_n_new, goal_n_far, goal_n_hyp,
+                 1000.0 * ring_t_goal, (rT3 - rT2).total_microseconds() * 1e-3);
+    std::fflush(goal_stats);
+  }
+
   // One line every 5 s at INFO, so the board's vio.log shows what the ring stereo is doing
   RingStats &rs = ring_stats;
   if (rs.t0 < 0)
@@ -1530,6 +1787,142 @@ void TrackKLT::feed_ring(const CameraData &message) {
     rs = RingStats();
     rs.t0 = message.timestamp;
   }
+}
+
+int TrackKLT::alloc_dir(size_t cam, const cv::Point2f &pt) const {
+  const cv::Mat *Ix = alloc_table(cam);
+  if (!Ix)
+    return -1;
+  int x = std::min(std::max((int)(pt.x / 4.0f), 0), Ix->cols - 1), y = std::min(std::max((int)(pt.y / 4.0f), 0), Ix->rows - 1);
+  return Ix->at<int16_t>(y, x);
+}
+
+const cv::Mat *TrackKLT::alloc_table(size_t cam) const {
+  if (alloc_dirs.empty() || !ring_R_ItoC.count(cam))
+    return nullptr;
+  const cv::Mat *Ix;
+  {
+    std::lock_guard<std::mutex> lck(goal_bearings_mtx);
+    auto it = alloc_idx.find(cam);
+    if (it == alloc_idx.end()) {
+      int W = camera_calib.at(cam)->w(), H = camera_calib.at(cam)->h();
+      cv::Mat m((H + 3) / 4, (W + 3) / 4, CV_16SC1);
+      Eigen::Matrix3d R_CtoI = ring_R_ItoC.at(cam).transpose();
+      for (int y = 0; y < m.rows; y++)
+        for (int x = 0; x < m.cols; x++) {
+          Eigen::Vector2f nrm = camera_calib.at(cam)->undistort_f(Eigen::Vector2f(4.0f * x + 1.5f, 4.0f * y + 1.5f));
+          Eigen::Vector3d b = (R_CtoI * Eigen::Vector3d(nrm(0), nrm(1), 1.0)).normalized();
+          int best = 0;
+          double bd = -2.0;
+          for (size_t d = 0; d < alloc_dirs.size(); d++) {
+            double c = b.dot(alloc_dirs[d]);
+            if (c > bd) bd = c, best = (int)d;
+          }
+          m.at<int16_t>(y, x) = (int16_t)best;
+        }
+      it = alloc_idx.emplace(cam, m).first;
+    }
+    Ix = &it->second;
+  }
+  return Ix;
+}
+
+bool TrackKLT::in_goal(size_t cam, const cv::Point2f &pt) const {
+  if (alloc_on > 0) {
+    if (!alloc_valid)
+      return false;
+    int d = alloc_dir(cam, pt);
+    return d >= 0 && alloc_target[d] >= 1.0f;
+  }
+  if (!goal_valid || !ring_R_ItoC.count(cam))
+    return false;
+  const cv::Mat *B;
+  {
+    std::lock_guard<std::mutex> lck(goal_bearings_mtx);
+    auto it = goal_bearings.find(cam);
+    if (it == goal_bearings.end()) {
+      int W = camera_calib.at(cam)->w(), H = camera_calib.at(cam)->h();
+      cv::Mat m((H + 3) / 4, (W + 3) / 4, CV_32FC3);
+      for (int y = 0; y < m.rows; y++)
+        for (int x = 0; x < m.cols; x++) {
+          Eigen::Vector2f n = camera_calib.at(cam)->undistort_f(Eigen::Vector2f(4.0f * x + 1.5f, 4.0f * y + 1.5f));
+          Eigen::Vector3f b(n(0), n(1), 1.0f);
+          b.normalize();
+          m.at<cv::Vec3f>(y, x) = cv::Vec3f(b(0), b(1), b(2));
+        }
+      it = goal_bearings.emplace(cam, m).first;
+    }
+    B = &it->second;
+  }
+  int x = std::min(std::max((int)(pt.x / 4.0f), 0), B->cols - 1), y = std::min(std::max((int)(pt.y / 4.0f), 0), B->rows - 1);
+  const cv::Vec3f &b = B->at<cv::Vec3f>(y, x);
+  Eigen::Vector3d g = (ring_R_ItoC.at(cam) * goal_I).normalized();
+  return b[0] * g(0) + b[1] * g(1) + b[2] * g(2) > goal_cos;
+}
+
+void TrackKLT::goal_setup() {
+  auto env = [](const char *name) {
+    const char *v = std::getenv(name);
+    return std::string(v ? v : "");
+  };
+  goal_on = 0;
+  if (!env("OV_GOAL_DEG").empty())
+    goal_cos = std::cos(std::atof(env("OV_GOAL_DEG").c_str()) * M_PI / 180.0);
+  if (!env("OV_GOAL_FEATS").empty())
+    goal_feats = std::atoi(env("OV_GOAL_FEATS").c_str());
+  if (!env("OV_GOAL_MIN_PX").empty())
+    goal_min_px = std::max(2, std::atoi(env("OV_GOAL_MIN_PX").c_str()));
+  if (!env("OV_GOAL_EPI_DEG").empty())
+    goal_epi_sin = std::sin(std::atof(env("OV_GOAL_EPI_DEG").c_str()) * M_PI / 180.0);
+  if (!env("OV_GOAL_HYP_ALL").empty())
+    goal_hyp_all = std::atoi(env("OV_GOAL_HYP_ALL").c_str());
+  std::stringstream ds(env("OV_GOAL_DEPTHS"));
+  std::string tok;
+  while (std::getline(ds, tok, ','))
+    if (!tok.empty() && std::atof(tok.c_str()) > 0)
+      goal_depths.push_back(std::atof(tok.c_str()));
+  std::string f = env("OV_GOAL_FILE");
+  if (!f.empty()) {
+    std::ifstream in(f);
+    double t, x, y, z;
+    while (in >> t >> x >> y >> z)
+      goal_track.emplace_back(t, Eigen::Vector3d(x, y, z));
+    std::sort(goal_track.begin(), goal_track.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+    goal_on = goal_track.empty() ? 0 : 1;
+  }
+  if (!env("OV_ALLOC_FEATS").empty())
+    alloc_feats = std::atoi(env("OV_ALLOC_FEATS").c_str());
+  if (!env("OV_EXTRA_FEATS").empty()) {          // the uniform control of the allocation maps: the same budget spread over the
+    num_features += std::atoi(env("OV_EXTRA_FEATS").c_str());   // whole image of every camera by the standard grid detector
+    PRINT_WARNING("[ALLOC]: uniform control, %d features per camera\n", num_features);
+  }
+  if (!env("OV_ALLOC_DIRS").empty() && !env("OV_ALLOC_FILE").empty()) {
+    std::ifstream dn(env("OV_ALLOC_DIRS"));
+    double x, y, z;
+    while (dn >> x >> y >> z)
+      alloc_dirs.emplace_back(Eigen::Vector3d(x, y, z).normalized());
+    std::ifstream in(env("OV_ALLOC_FILE"));
+    std::string line;
+    while (std::getline(in, line)) {
+      std::stringstream ls(line);
+      double t;
+      if (!(ls >> t))
+        continue;
+      std::vector<float> w;
+      float v;
+      while (ls >> v)
+        w.push_back(v);
+      if (w.size() == alloc_dirs.size())
+        alloc_track.emplace_back(t, w);
+    }
+    std::sort(alloc_track.begin(), alloc_track.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+    alloc_on = alloc_track.empty() ? 0 : 1;
+    PRINT_WARNING("[ALLOC]: %zu directions, %zu rows (on %d), budget %d features\n", alloc_dirs.size(), alloc_track.size(), alloc_on, alloc_feats);
+  }
+  if (!env("OV_GOAL_STATS").empty())
+    goal_stats = std::fopen(env("OV_GOAL_STATS").c_str(), "w");
+  PRINT_WARNING("[GOAL]: goal track %zu rows (on %d), sector %.0f deg, %d features, min %d px, %zu depth hypotheses (all candidates %d)\n",
+                goal_track.size(), goal_on, std::acos(goal_cos) * 180.0 / M_PI, goal_feats, goal_min_px, goal_depths.size(), goal_hyp_all);
 }
 
 void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,
