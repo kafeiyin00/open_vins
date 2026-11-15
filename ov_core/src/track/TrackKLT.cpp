@@ -1601,7 +1601,16 @@ void TrackKLT::feed_ring(const CameraData &message) {
       }
     }
   }
-  if (goal_on > 0) {
+  if (goal_on == 2) {
+    std::ifstream in(goal_live);
+    double t, x, y, z;
+    if (in >> t >> x >> y >> z && std::abs(t - message.timestamp) < 0.5) {
+      goal_I = Eigen::Vector3d(x, y, z);
+      goal_valid = goal_I.norm() > 1e-6;
+      if (goal_valid)
+        goal_I.normalize();
+    }
+  } else if (goal_on > 0) {
     auto it = std::lower_bound(goal_track.begin(), goal_track.end(), message.timestamp,
                                [](const std::pair<double, Eigen::Vector3d> &a, double t) { return a.first < t; });
     double best = 1e9;
@@ -1890,6 +1899,11 @@ void TrackKLT::goal_setup() {
     std::sort(goal_track.begin(), goal_track.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
     goal_on = goal_track.empty() ? 0 : 1;
   }
+  // closed loop (2026-11-15): OV_GOAL_LIVE names a one-line file "t x y z" (goal direction in the IMU frame) that a ROS node
+  // rewrites (atomically) from the planner's intention; it is read in every frame and used while it is at most 0.5 s old
+  goal_live = env("OV_GOAL_LIVE");
+  if (!goal_live.empty())
+    goal_on = 2;
   if (!env("OV_ALLOC_FEATS").empty())
     alloc_feats = std::atoi(env("OV_ALLOC_FEATS").c_str());
   if (!env("OV_EXTRA_FEATS").empty()) {          // the uniform control of the allocation maps: the same budget spread over the

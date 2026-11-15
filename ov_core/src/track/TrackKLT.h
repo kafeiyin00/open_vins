@@ -206,6 +206,7 @@ protected:
   double goal_cos = 0.866, goal_epi_sin = 0.026;
   std::vector<double> goal_depths;
   std::vector<std::pair<double, Eigen::Vector3d>> goal_track;
+  std::string goal_live;
   Eigen::Vector3d goal_I = Eigen::Vector3d::Zero();
   bool goal_valid = false;
   double ring_t_goal = 0;
